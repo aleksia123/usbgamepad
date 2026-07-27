@@ -11,6 +11,12 @@ add_compile_definitions(PICO_BOOT_STAGE2_CHOOSE_GENERIC_03H=1 PICO_XOSC_STARTUP_
 # Must be set before the SDK init include below.
 set(PICO_PLATFORM rp2350)
 
+# Pinned explicitly (matches the SDK's existing implicit default for
+# PICO_BOARD none) so pad_config_store.c's reserved-sector offset and the
+# linker's FLASH region length are always derived from the same value and
+# can never drift apart - see PAD_CONFIG_FLASH_SIZE_BYTES below.
+set(PICO_FLASH_SIZE_BYTES "2 * 1024 * 1024")
+
 include($ENV{PICO_SDK_PATH}/pico_sdk_init.cmake)
 
 project(${NAME} C CXX ASM)
@@ -36,7 +42,11 @@ target_compile_options(tusb_gamepad PRIVATE -w) # suppress warnings from third-p
 file(GLOB_RECURSE SOURCES
     "src/main.c"
     "src/hid_app.c"
-    "src/xinput_host.c")
+    "src/xinput_host.c"
+    "src/pad_config.c"
+    "src/pad_config_store.c"
+    "src/boot_mode.c"
+    "src/cdc_config.c")
 
 add_executable(${NAME} ${SOURCES})
 
@@ -44,11 +54,17 @@ target_include_directories(${NAME} PUBLIC
     ${ROOT}/src
     ${ROOT}/lib)
 
+target_compile_definitions(${NAME} PRIVATE
+    "PAD_CONFIG_FLASH_SIZE_BYTES=(${PICO_FLASH_SIZE_BYTES})")
+
 target_link_libraries(${NAME}
     pico_stdlib
     pico_multicore
     hardware_pio
     hardware_clocks
+    hardware_watchdog
+    hardware_flash
+    pico_flash
     tinyusb_board
     tinyusb_host
     pico_pio_usb

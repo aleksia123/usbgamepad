@@ -11,6 +11,11 @@
 #include "pio_usb.h"
 #include "tusb_gamepad.h"
 #include "hardware/timer.h"
+#include "pico/flash.h"
+#include "boot_mode.h"
+#include "cdc_config.h"
+#include "pad_config.h"
+#include "pad_config_store.h"
 
 // ------------------------------------------------------------------ //
 //  Board selection
@@ -66,6 +71,11 @@ void usbh_task()
         gpio_put(VCC_EN_PIN, 1);
     #endif
 
+    // Required before any flash_safe_execute() call (pad_config_store.c) can
+    // succeed: it lets core0 safely lock out this core while it erases/
+    // programs flash. Without it, flash writes are refused, not unsafe.
+    flash_safe_execute_core_init();
+
     pio_usb_configuration_t pio_cfg = PIO_USB_CONFIG;
     tuh_configure(BOARD_TUH_RHPORT, TUH_CFGID_RPI_PIO_USB_CONFIGURATION, &pio_cfg);
 
@@ -89,9 +99,21 @@ int main(void)
 
     board_init();
 
-    enum InputMode input_mode = INPUT_MODE_XINPUT; // choose an input mode
+    // flash_safe_execute() (used by pad_config_store_save) must be called from
+    // a core that has registered via flash_safe_execute_core_init(). Saves run
+    // from THIS core (core0) inside cdc_config_task(), so core0 must init here
+    // -- before the load and before core1 launches. core1 does its own init at
+    // the top of usbh_task(); BOTH are required (the writer pauses the peer).
+    flash_safe_execute_core_init();
+
+    // Load any flash-persisted stick/trigger tuning before anything else, so
+    // it's live regardless of which InputMode we end up booting into.
+    pad_config_store_load(&g_pad_config);
+
+    enum InputMode input_mode = boot_mode_on_startup();
 
     init_tusb_gamepad(input_mode); // initialize usb device with chosen input mode
+    cdc_config_init(input_mode);   // arms the config-mode grace timer iff USBSERIAL
 
     multicore_reset_core1();
     multicore_launch_core1(usbh_task); // usb host stack on core 1
@@ -100,6 +122,7 @@ int main(void)
     {
         tud_task();
         tusb_gamepad_task();
+        cdc_config_task();
     }
 
     return 0;

@@ -128,8 +128,21 @@
 // HID buffer size Should be sufficient to hold ID (if any) + Data
 #define CFG_TUD_HID_EP_BUFSIZE    64
 
-#define CFG_TUD_CDC_TX_BUFSIZE 256
-#define CFG_TUD_CDC_RX_BUFSIZE 256
+// 1024 (not 512, not 256): sized for the LARGEST line cdc_config.c emits,
+// which is the PAD_CONFIG.GET / .SET reply, not the input stream.
+//   INPUT.STREAM event (sticks + triggers + 16 named buttons)  ~330 bytes
+//   PAD_CONFIG.GET reply (28 named config fields + envelope)   1120 bytes
+// The 512 that was here covered the stream but not the config reply, so every
+// GET/SET response went out chopped mid-object and the web editor's
+// JSON.parse() threw on it - the pad answered, the UI just couldn't read the
+// answer. send_line() now also loops until the whole line is accepted, so this
+// value is headroom rather than a hard requirement.
+// #undef first: board_config.h (included above) already defaulted these to
+// 256 before we get here, and redefining without #undef is just a warning.
+#undef CFG_TUD_CDC_TX_BUFSIZE
+#define CFG_TUD_CDC_TX_BUFSIZE 1536
+#undef CFG_TUD_CDC_RX_BUFSIZE
+#define CFG_TUD_CDC_RX_BUFSIZE 512
 
 //--------------------------------------------------------------------
 // HOST CONFIGURATION
