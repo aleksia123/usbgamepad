@@ -1,0 +1,989 @@
+<!DOCTYPE html>
+<!--
+  tusb_gamepad — Live Config Editor
+  ================================================================
+  Talks to cdc_config.c over WebSerial: one JSON object per line, both
+  directions. Open this file directly (file://) in Chrome, Edge or Opera —
+  Firefox and Safari have no WebSerial.
+
+  WHAT "LIVE" MEANS HERE
+  The pad runs ONE USB personality per boot (boot_mode.h). While this editor is
+  connected the pad is a serial device, NOT a controller: your edits apply to
+  g_pad_config instantly and you can watch the shaped output in the visualiser,
+  but Windows is not receiving pad input. "Switch to Xbox mode" reboots into
+  XInput and this serial port disappears — that is the success path, not a
+  failure. Unplug/replug puts it back in config mode (a power-on reset clears
+  the watchdog scratch that carries the mode request).
+
+  FIXED IN THIS REVISION
+  1. The firmware's PAD_CONFIG.GET/.SET reply is 654 bytes and its buffers were
+     512, so every reply arrived chopped mid-object and JSON.parse() threw.
+     That is why the page connected and then did nothing at all. Fixed
+     firmware-side (txbuf, CFG_TUD_CDC_TX_BUFSIZE, chunked send_line); this
+     page now also surfaces an unparsable reply loudly instead of logging it
+     once and moving on, and warns if a GET goes unanswered.
+  2. Every stage kernel early-returns on a value of 0, and every default value
+     used to be 0 — so flipping a stage on changed nothing. Each stage now
+     carries a real default (see STAGES below); switching a stage on from a
+     dead value promotes it to that default in the same command.
+  3. Controls were live-looking while disconnected: sliders moved, labels
+     updated, nothing was sent. They are properly disabled now.
+  4. Every SET echo used to rewrite all 16 controls, so a reply landing while
+     you dragged a second slider yanked it back. Echoes now only correct
+     fields you have not touched in the last 750 ms.
+  5. Slider ranges were the raw byte range (0..255 = up to 199% of stick
+     travel) rather than the usable band. They now match the PAD_*_MIN/MAX
+     constants in pad_config.h.
+-->
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>tusb_gamepad — Live Config Editor</title>
+  <style>
+    :root {
+      --bg: #0d0f14;
+      --panel: #161a22;
+      --panel2: #1b2029;
+      --edge: #252a34;
+      --txt: #e8ebf1;
+      --mut: #9aa3b2;
+      --acc: #5b8dff;
+      --acc2: #8a6bff;
+      --ok: #3ecf8e;
+      --bad: #ff5c6c;
+      --warn: #f0b429;
+      --glow: rgba(91, 141, 255, .35);
+    }
+
+    * {
+      box-sizing: border-box
+    }
+
+    body {
+      margin: 0;
+      color: var(--txt);
+      font: 14px/1.5 system-ui, Segoe UI, Roboto, sans-serif;
+      background:
+        radial-gradient(1200px 600px at 15% -10%, rgba(91, 141, 255, .10), transparent 60%),
+        radial-gradient(1000px 500px at 100% 0%, rgba(138, 107, 255, .08), transparent 55%),
+        var(--bg);
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--edge);
+      position: sticky;
+      top: 0;
+      background: rgba(13, 15, 20, .72);
+      backdrop-filter: blur(10px);
+      z-index: 5;
+      flex-wrap: wrap
+    }
+
+    h1 {
+      font-size: 15px;
+      margin: 0;
+      font-weight: 600
+    }
+
+    .status {
+      margin-left: auto;
+      font-size: 12px;
+      color: var(--mut)
+    }
+
+    .dot {
+      display: inline-block;
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--bad);
+      margin-right: 6px;
+      vertical-align: middle;
+      box-shadow: 0 0 0 0 rgba(255, 92, 108, .5)
+    }
+
+    .dot.on {
+      background: var(--ok);
+      animation: pulse 2s infinite
+    }
+
+    @keyframes pulse {
+      0% {
+        box-shadow: 0 0 0 0 rgba(62, 207, 142, .45)
+      }
+
+      70% {
+        box-shadow: 0 0 0 7px rgba(62, 207, 142, 0)
+      }
+
+      100% {
+        box-shadow: 0 0 0 0 rgba(62, 207, 142, 0)
+      }
+    }
+
+    button {
+      background: linear-gradient(135deg, var(--acc), var(--acc2));
+      color: #fff;
+      border: 0;
+      border-radius: 8px;
+      padding: 8px 14px;
+      font: inherit;
+      font-weight: 500;
+      cursor: pointer;
+      transition: transform .12s ease, box-shadow .12s ease, opacity .12s;
+      box-shadow: 0 2px 10px -2px var(--glow)
+    }
+
+    button:hover:not(:disabled) {
+      transform: translateY(-1px);
+      box-shadow: 0 6px 18px -4px var(--glow)
+    }
+
+    button:active:not(:disabled) {
+      transform: translateY(0)
+    }
+
+    button:focus-visible {
+      outline: 2px solid var(--acc);
+      outline-offset: 2px
+    }
+
+    button.ghost {
+      background: transparent;
+      border: 1px solid var(--edge);
+      color: var(--txt);
+      box-shadow: none
+    }
+
+    button.ghost:hover:not(:disabled) {
+      border-color: var(--acc);
+      color: #fff
+    }
+
+    button#xinput {
+      background: linear-gradient(135deg, #2ea043, #3ecf8e)
+    }
+
+    button:disabled {
+      opacity: .4;
+      cursor: not-allowed;
+      transform: none;
+      box-shadow: none
+    }
+
+    main {
+      max-width: 820px;
+      margin: 0 auto;
+      padding: 18px
+    }
+
+    .card {
+      background: linear-gradient(180deg, var(--panel2), var(--panel));
+      border: 1px solid var(--edge);
+      border-radius: 12px;
+      padding: 16px;
+      box-shadow: 0 1px 0 rgba(255, 255, 255, .03) inset, 0 10px 30px -20px #000
+    }
+
+    .card+.card {
+      margin-top: 14px
+    }
+
+    .card h2 {
+      font-size: 12px;
+      letter-spacing: .05em;
+      text-transform: uppercase;
+      color: var(--mut);
+      margin: 0 0 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px
+    }
+
+    .stage {
+      border-top: 1px solid var(--edge);
+      padding-top: 12px;
+      margin-top: 12px
+    }
+
+    .stage:first-of-type {
+      border-top: 0;
+      padding-top: 0;
+      margin-top: 0
+    }
+
+    .stage.off .field {
+      opacity: .45
+    }
+
+    .field {
+      margin: 10px 0 0
+    }
+
+    .field label {
+      display: flex;
+      justify-content: space-between;
+      font-size: 13px;
+      margin-bottom: 5px
+    }
+
+    .field .val {
+      color: var(--acc);
+      font-variant-numeric: tabular-nums
+    }
+
+    .field .val.stale {
+      color: var(--mut)
+    }
+
+    .row {
+      display: flex;
+      align-items: center;
+      gap: 10px
+    }
+
+    .row .name {
+      font-weight: 500
+    }
+
+    .switch {
+      width: 44px;
+      height: 24px;
+      border-radius: 12px;
+      background: var(--edge);
+      position: relative;
+      cursor: pointer;
+      flex: 0 0 auto;
+      border: 0;
+      padding: 0;
+      box-shadow: none;
+      transition: background .15s
+    }
+
+    .switch:hover:not(:disabled) {
+      transform: none;
+      box-shadow: none
+    }
+
+    .switch.on {
+      background: var(--acc)
+    }
+
+    .switch::after {
+      content: "";
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      background: #fff;
+      transition: transform .15s
+    }
+
+    .switch.on::after {
+      transform: translateX(20px)
+    }
+
+    .mon {
+      font: 12px/1.6 ui-monospace, Menlo, monospace;
+      color: var(--mut);
+      white-space: pre;
+      overflow-x: auto
+    }
+
+    .hint {
+      font-size: 11px;
+      color: var(--mut);
+      margin: 4px 0 0
+    }
+
+    .log {
+      font: 11px/1.5 ui-monospace, monospace;
+      background: #0a0c10;
+      border: 1px solid var(--edge);
+      border-radius: 8px;
+      padding: 10px;
+      height: 150px;
+      overflow: auto;
+      color: var(--mut);
+      white-space: pre-wrap
+    }
+
+    .log .e {
+      color: var(--bad)
+    }
+
+    .log .w {
+      color: var(--warn)
+    }
+
+    .log .g {
+      color: var(--ok)
+    }
+
+    input[type=range] {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 100%;
+      height: 6px;
+      border-radius: 4px;
+      background: var(--edge);
+      outline: none
+    }
+
+    input[type=range]:disabled {
+      opacity: .5
+    }
+
+    input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--acc), var(--acc2));
+      cursor: pointer;
+      box-shadow: 0 0 8px -1px var(--glow);
+      border: 2px solid #0d0f14
+    }
+
+    input[type=range]::-moz-range-thumb {
+      width: 16px;
+      height: 16px;
+      border: 2px solid #0d0f14;
+      border-radius: 50%;
+      background: var(--acc);
+      cursor: pointer
+    }
+
+    input[type=range]:focus-visible {
+      outline: 2px solid var(--acc);
+      outline-offset: 4px
+    }
+
+    .cols {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px
+    }
+
+    @media(max-width:700px) {
+      .cols {
+        grid-template-columns: 1fr
+      }
+    }
+
+    .viz {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px
+    }
+
+    .viz canvas {
+      width: 100%;
+      max-width: 250px;
+      aspect-ratio: 1;
+      background: radial-gradient(circle at 50% 50%, #10141b, #0a0c10);
+      border: 1px solid var(--edge);
+      border-radius: 12px
+    }
+
+    .viz .lbl {
+      font: 11px/1.4 ui-monospace, monospace;
+      color: var(--mut);
+      letter-spacing: .04em
+    }
+
+    .viz .coord {
+      color: var(--acc);
+      font-variant-numeric: tabular-nums
+    }
+
+    .legend {
+      display: flex;
+      gap: 14px;
+      flex-wrap: wrap;
+      font-size: 11px;
+      color: var(--mut);
+      margin-top: 10px;
+      justify-content: center
+    }
+
+    .legend i {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 2px;
+      margin-right: 5px;
+      vertical-align: -1px
+    }
+
+    @media (prefers-reduced-motion:reduce) {
+      * {
+        animation: none !important;
+        transition: none !important
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <header>
+    <h1>tusb_gamepad — Live Config Editor</h1>
+    <span class="status"><span id="dot" class="dot"></span><span id="st">Not connected</span></span>
+    <button id="connect">Connect</button>
+    <button id="disconnect" class="ghost" disabled>Disconnect</button>
+    <button id="reset" class="ghost" disabled>Restore defaults</button>
+    <button id="xinput" class="ghost" disabled>Switch to Xbox mode</button>
+  </header>
+  <main>
+    <!-- Both stick cards are generated from the STAGES table in the script so the
+       markup, the slider bounds and the wire field names can never drift apart.
+       Add a stage in one place and it appears on both sticks. -->
+    <div class="cols">
+      <div class="card">
+        <h2>Left stick — movement</h2>
+        <div id="left"></div>
+      </div>
+      <div class="card">
+        <h2>Right stick — look</h2>
+        <div id="right"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Stick visualiser</h2>
+      <p class="hint" style="margin:0 0 12px">Dot is the processed output read back from the pad. Overlays draw only
+        while their stage is on. The square is the raw per-axis limit; the solid ring is full scale; the corner region
+        between them is where a diagonal overshoots.</p>
+      <div class="cols">
+        <div class="viz">
+          <canvas id="vizL" width="460" height="460"></canvas>
+          <div class="lbl">LEFT &nbsp; <span class="coord" id="coordL">0, 0</span></div>
+        </div>
+        <div class="viz">
+          <canvas id="vizR" width="460" height="460"></canvas>
+          <div class="lbl">RIGHT &nbsp; <span class="coord" id="coordR">0, 0</span></div>
+        </div>
+      </div>
+      <div class="legend">
+        <span><i style="background:#2a3242"></i>axial deadzone</span>
+        <span><i style="background:#3a4a3a"></i>radial deadzone</span>
+        <span><i style="background:#5b8dff"></i>angular snap</span>
+        <span><i style="background:#8a6bff"></i>corner cap</span>
+        <span><i style="background:var(--ok)"></i>live stick</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Live input monitor</h2>
+      <div class="mon" id="mon">Connect, then start the stream.</div>
+      <button id="stream" class="ghost" disabled style="margin-top:10px">Start stream</button>
+    </div>
+
+    <div class="card">
+      <h2>Log</h2>
+      <div class="log" id="log"></div>
+    </div>
+  </main>
+
+  <script>
+    "use strict";
+    /* ===========================================================================
+       Protocol — newline-delimited JSON, matching cdc_config.c
+         send: {"cmd":"PAD_CONFIG.GET"}\n
+               {"cmd":"PAD_CONFIG.SET","cfg":{"left_stick_radial_deadzone":14}}\n
+               {"cmd":"PAD_CONFIG.RESET"}\n
+               {"cmd":"INPUT.STREAM","enable":true}\n
+               {"cmd":"MODE.SET","mode":"XINPUT"}\n
+         recv: {"ok":true,...,"cfg":{...}}\n  and  {"evt":"input",...}\n
+       No SYNC byte, no CRC — the firmware reads to '\n' then strstr-parses.
+       Keep each SET line short: linebuf in cdc_config.c is 256 bytes and a line
+       longer than that is dropped, not truncated.
+       =========================================================================== */
+
+    /* ---------------------------------------------------------------------------
+       STAGES — single source of truth for the UI.
+       These bounds mirror pad_config.h (PAD_DEADZONE_MIN/MAX, PAD_ANGULAR_MIN/MAX,
+       PAD_CORNER_CAP_MIN/MAX). If you change them there, change them here.
+    
+         key   : goes into the field name as `${side}_stick_${key}`
+         enable: `${side}_stick_${enableKey}_enabled`
+         min/max: usable band, NOT the raw byte range. A deadzone byte is a
+                  half-width in units of 256 int16 counts, so fraction of full
+                  travel = value/128; the byte would allow 255 (199% — stick
+                  permanently dead), hence the 64 ceiling at 50%.
+         onMin : below this a stage is a no-op in firmware, so switching the stage
+                 on from any value under it promotes the value to `def`.
+         def   : the value a freshly-enabled stage lands on.
+       --------------------------------------------------------------------------- */
+    const STAGES = [
+      /* Runs FIRST in the firmware pipeline, so it is listed first here too — the
+         card order is the processing order. Undoes a square/rectangular gate remap:
+         0 leaves it alone, 100 is the exact inverse, in between keeps that share of
+         the diagonal overshoot. Ships off; if the pad can disable its own remap
+         that is strictly better than correcting it here. */
+      {
+        id: "square_to_circle", label: "Square \u2192 circle",
+        key: "square_to_circle_pct", enableKey: "square_to_circle",
+        min: 0, max: 100, onMin: 1, def: { left: 100, right: 100 }, unit: "%",
+        fmt: v => v === 100 ? "100% \u00b7 fully circular" : `${v}% correction`,
+        hint: "A square gate scales each direction by 1/max(|cos|,|sin|) \u2014 1.0 at the cardinals, up to \u221a2 at 45\u00b0 \u2014 so the diagonals bulge outward and magnitude stops being uniform with direction. This applies the exact inverse. Halo's rotational aim assist is keyed on magnitude, so a direction-dependent magnitude means direction-dependent assist. 100 fully circularises; lower values keep some diagonal reach, which is the one thing a pad-side on/off toggle can't give you."
+      },
+      {
+        id: "axial_deadzone", label: "Axial deadzone",
+        key: "axial_deadzone", enableKey: "axial_deadzone",
+        min: 0, max: 64, onMin: 2, def: { left: 8, right: 6 }, unit: "",
+        fmt: v => `${v} · ${(v / 128 * 100).toFixed(1)}% per axis`,
+        hint: "Per-axis dead band, judged on each axis alone. Squares off the gate — the stage most likely to distort diagonals, so keep it small or off for aim."
+      },
+      {
+        id: "radial_deadzone", label: "Radial deadzone",
+        key: "radial_deadzone", enableKey: "radial_deadzone",
+        min: 0, max: 64, onMin: 2, def: { left: 5, right: 8 }, unit: "",
+        fmt: v => `${v} · ${(v / 128 * 100).toFixed(1)}% radius`,
+        hint: "Circular centre deadzone judged on vector magnitude, with survivors rescaled to full range. No angle bias, no jump at the edge."
+      },
+      {
+        id: "angular_restrict", label: "Angular restrict",
+        key: "angular_restrict_deg", enableKey: "angular_restrict",
+        min: 0, max: 45, onMin: 1, def: { left: 5, right: 4 }, unit: "°",
+        fmt: v => `${v}° half-width`,
+        hint: "Pulls near-cardinal angles onto the pure axis; magnitude is untouched. A few degrees on the look stick trims the R2P's spurious Y that rides on a large X. 45° would snap everything and make diagonals unreachable."
+      },
+      {
+        id: "corner_cap", label: "Corner cap",
+        key: "corner_cap_pct", enableKey: "corner_cap",
+        min: 100, max: 142, onMin: 100, def: { left: 100, right: 100 }, unit: "%",
+        fmt: v => `${v}% of full scale`,
+        hint: "Clips vector magnitude, trimming only the diagonal tip — travel past the cap goes dead. With the BBW rectangle boundary algorithm off the R2P gate is already circular, so there is no overshoot left to trim and this stage does nothing on this pad. Above 142 the cap circle sits outside the reachable square (max diagonal is √2 × 32767 = 141.4%), so it can never trigger."
+      },
+      {
+        id: "output_scale", label: "Output scale",
+        key: "output_scale_pct", enableKey: "output_scale",
+        min: 50, max: 150, onMin: 50, neutral: 100, def: { left: 100, right: 96 }, unit: "%",
+        fmt: v => v === 100 ? "100% · neutral" : `${v}% of full range`,
+        hint: "Rescales the whole range proportionally instead of clipping it, so no travel goes dead. 96 puts Halo's Max Input Threshold out of reach, which stops look Acceleration engaging at all — you aim on the base curve alone. Above 100 gives more response per millimetre of thumb travel, but reaches the threshold sooner, so it pulls the opposite way."
+      },
+      /* Runs LAST. Note this stage's neutral point is 100, in the MIDDLE of its
+         range — every other stage is a no-op at its minimum. Toggling it on while
+         it sits at 100 would therefore be a silent no-op, so `neutral` makes the
+         toggle promote to the side default the same way `onMin` does elsewhere. */
+      /* Runs LAST — nothing may follow it, so it is the last card. Deterministic
+         square-wave ROTATION of the stick vector: magnitude is preserved exactly,
+         only the angle alternates, so aim-assist strength stays constant while the
+         input keeps changing. A zero vector rotates to zero, so it cannot create
+         input at rest and needs no deadzone interaction. */
+      {
+        id: "dither", label: "Dither",
+        key: "dither_amp_deg10", enableKey: "dither",
+        min: 0, max: 50, onMin: 1, def: { left: 20, right: 10 }, unit: "\u00b0",
+        fmt: v => `\u00b1${(v / 10).toFixed(1)}\u00b0 @ ~31 Hz`,
+        hint: "Alternating \u00b1 rotation to keep rotational aim assist engaged. Deterministic, not random \u2014 a jitter would be untunable and unrepeatable between test runs. On the left stick it wobbles movement direction at constant speed; on the right it visibly moves the reticle, so start lower there. Below about quarter deflection a 1\u00b0 dither falls under one quantisation step on a 256-step pad and stops registering."
+      },
+    ];
+
+    const SIDES = ["left", "right"];
+    const valueField = (side, st) => `${side}_stick_${st.key}`;
+    const enableField = (side, st) => `${side}_stick_${st.enableKey}_enabled`;
+
+    /* ---- connection state ---------------------------------------------------- */
+    let port = null, reader = null, writer = null, readAbort = null;
+    let streaming = false;
+    let switchingMode = false;   // true while MODE.SET drops the port on purpose
+    let rxbuf = "";
+    let getPending = null;       // watchdog timer for an unanswered PAD_CONFIG.GET
+
+    const $ = s => document.querySelector(s);
+    const logEl = $("#log");
+
+    function log(msg, cls) {
+      const line = document.createElement("span");
+      if (cls) line.className = cls;
+      line.textContent = msg + "\n";
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    /* Enable/disable the whole surface in one place. Controls stay genuinely
+       disabled while disconnected — the old page only dimmed them, so dragging a
+       slider updated the label and sent nothing, which reads as broken firmware. */
+    function setConn(on) {
+      $("#dot").classList.toggle("on", on);
+      $("#st").textContent = on ? "Connected" : "Not connected";
+      $("#connect").disabled = on;
+      ["#disconnect", "#stream", "#xinput", "#reset"].forEach(s => { $(s).disabled = !on; });
+      document.querySelectorAll(".switch, input[type=range]").forEach(el => { el.disabled = !on; });
+      if (!on) {
+        document.querySelectorAll(".val").forEach(v => v.classList.add("stale"));
+      }
+    }
+
+    /* ---- build the UI from STAGES -------------------------------------------- */
+    function buildSide(side) {
+      const host = document.getElementById(side);
+      STAGES.forEach(st => {
+        const wrap = document.createElement("div");
+        wrap.className = "stage off";
+        wrap.dataset.side = side; wrap.dataset.stage = st.id;
+        wrap.innerHTML = `
+      <div class="row">
+        <button class="switch" type="button" role="switch" aria-checked="false"
+                aria-label="${st.label}" disabled></button>
+        <span class="name">${st.label}</span>
+      </div>
+      <div class="field">
+        <label><span>Value</span><span class="val stale">–</span></label>
+        <input type="range" min="${st.min}" max="${st.max}" step="1"
+               value="${st.def[side]}" disabled aria-label="${st.label} value">
+        <p class="hint">${st.hint}</p>
+      </div>`;
+        host.appendChild(wrap);
+
+        const sw = wrap.querySelector(".switch");
+        const range = wrap.querySelector("input[type=range]");
+        const val = wrap.querySelector(".val");
+
+        /* Toggling a stage ON: if the value is below the point where the firmware
+           kernel does anything (onMin), promote it to the stage default and send
+           BOTH fields in one line. Otherwise a toggle is a silent no-op — the bug
+           that made this page look dead. Toggling OFF never touches the value, so
+           a parked tuning survives. */
+        sw.addEventListener("click", () => {
+          if (sw.disabled) return;
+          const on = !sw.classList.contains("on");
+          const cfg = {};
+          cfg[enableField(side, st)] = on;
+          const cur = parseInt(range.value, 10) || 0;
+          if (on && (cur < st.onMin || cur === st.neutral)) {
+            range.value = st.def[side];
+            val.textContent = st.fmt(st.def[side]);
+            cfg[valueField(side, st)] = st.def[side];
+            log(`${side} ${st.label}: value was below the useful floor, set to ${st.def[side]}`, "w");
+          }
+          setStageOn(wrap, on);
+          touch(valueField(side, st));
+          queueSet(cfg);
+          drawAllSticks();
+        });
+
+        range.addEventListener("input", () => {
+          const v = parseInt(range.value, 10) || 0;
+          val.textContent = st.fmt(v); val.classList.remove("stale");
+          touch(valueField(side, st));
+          const cfg = {}; cfg[valueField(side, st)] = v;
+          queueSet(cfg);
+          drawAllSticks();
+        });
+      });
+    }
+
+    function setStageOn(wrap, on) {
+      const sw = wrap.querySelector(".switch");
+      sw.classList.toggle("on", on);
+      sw.setAttribute("aria-checked", String(on));
+      wrap.classList.toggle("off", !on);
+    }
+
+    SIDES.forEach(buildSide);
+
+    /* ---- reading the UI back ------------------------------------------------- */
+    function stageEl(side, st) { return document.querySelector(`.stage[data-side="${side}"][data-stage="${st.id}"]`); }
+    function cfgVal(side, st) { const el = stageEl(side, st); return el ? (parseInt(el.querySelector("input[type=range]").value, 10) || 0) : 0; }
+    function isOn(side, st) { const el = stageEl(side, st); return !!el && el.querySelector(".switch").classList.contains("on"); }
+    function stageById(id) { return STAGES.find(s => s.id === id); }
+
+    /* ---- send ---------------------------------------------------------------- */
+    async function sendCmd(obj) {
+      if (!writer) { log("✗ not connected — nothing sent", "e"); return; }
+      const line = JSON.stringify(obj) + "\n";
+      if (line.length > 250) { log("✗ line too long for the firmware's 256-byte linebuf", "e"); return; }
+      try { await writer.write(line); log("→ " + JSON.stringify(obj)); }
+      catch (e) {
+        if (switchingMode) { log("↻ port dropped (expected — pad rebooting into Xbox mode)", "g"); }
+        else { log("✗ write failed: " + e.message, "e"); disconnect(); }
+      }
+    }
+
+    /* Debounce edits, then send ONE line per stage. Batching per stage keeps each
+       line ~100 bytes, well inside the firmware's 256-byte line buffer, while
+       still letting an enable+value pair land atomically. */
+    const pending = {};
+    let sendTimer = null;
+    function queueSet(cfgFragment) {
+      Object.assign(pending, cfgFragment);
+      clearTimeout(sendTimer);
+      sendTimer = setTimeout(() => {
+        const fields = Object.keys(pending);
+        // group by stage so enable+value from one toggle travel together
+        const groups = {};
+        fields.forEach(f => {
+          const g = f.replace(/_enabled$/, "").replace(/_(deg|pct)$/, "");
+          (groups[g] = groups[g] || {})[f] = pending[f];
+        });
+        Object.values(groups).forEach(cfg => sendCmd({ cmd: "PAD_CONFIG.SET", cfg }));
+        for (const k in pending) delete pending[k];
+      }, 120);
+    }
+
+    /* Fields the user has touched recently are protected from being overwritten by
+       a reply that was already in flight — the old page rewrote all 16 controls on
+       every echo, so a reply landing mid-drag snapped the slider back. */
+    const touched = {};
+    const TOUCH_HOLD_MS = 750;
+    function touch(field) { touched[field] = performance.now(); }
+    function isTouched(field) { return (performance.now() - (touched[field] || 0)) < TOUCH_HOLD_MS; }
+
+    /* ---- connect / disconnect ------------------------------------------------ */
+    async function connect() {
+      try {
+        port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 115200 });
+        /* WebSerial opens with DTR deasserted and TinyUSB's tud_cdc_connected()
+           gates on DTR, so without this the pad thinks no host is attached and the
+           input stream never starts. */
+        try { await port.setSignals({ dataTerminalReady: true, requestToSend: true }); } catch (e) { }
+
+        const enc = new TextEncoderStream();
+        enc.readable.pipeTo(port.writable).catch(() => { });
+        writer = enc.writable.getWriter();
+
+        readAbort = new AbortController();
+        const dec = new TextDecoderStream();
+        port.readable.pipeTo(dec.writable, { signal: readAbort.signal }).catch(() => { });
+        reader = dec.readable.getReader();
+
+        setConn(true);
+        log("connected @115200, DTR asserted", "g");
+        readLoop();
+        setTimeout(requestConfig, 150); // let the device settle, then pull the config
+      } catch (e) {
+        log("✗ connect failed: " + e.message, "e");
+        setConn(false); port = null;
+      }
+    }
+
+    /* GET with a watchdog. A silent GET is the signature of a reply the pad sent
+       but we couldn't parse, or of a pad that already timed out of config mode. */
+    function requestConfig() {
+      sendCmd({ cmd: "PAD_CONFIG.GET" });
+      clearTimeout(getPending);
+      getPending = setTimeout(() => {
+        log("✗ no config reply after 2 s.", "e");
+        log("   Check: is the pad still in config mode? cdc_config.c reboots into", "e");
+        log("   XInput 60 s after boot if no line ever arrives. Unplug/replug and", "e");
+        log("   connect within a minute. If a reply is logged as (unparsed), the", "e");
+        log("   firmware is chopping the line — its TX buffers need to hold 654 B.", "e");
+      }, 2000);
+    }
+
+    async function disconnect() {
+      streaming = false; $("#stream").textContent = "Start stream";
+      clearTimeout(getPending);
+      try { if (reader) { await reader.cancel().catch(() => { }); } } catch (e) { }
+      try { if (readAbort) readAbort.abort(); } catch (e) { }
+      try { if (writer) { await writer.close().catch(() => { }); } } catch (e) { }
+      try { if (port) { await port.close().catch(() => { }); } } catch (e) { }
+      reader = writer = port = readAbort = null; rxbuf = "";
+      setConn(false); log("disconnected");
+    }
+
+    /* ---- receive ------------------------------------------------------------- */
+    async function readLoop() {
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          rxbuf += value;
+          let nl;
+          while ((nl = rxbuf.indexOf("\n")) >= 0) {
+            const line = rxbuf.slice(0, nl).trim();
+            rxbuf = rxbuf.slice(nl + 1);
+            if (line) handleLine(line);
+          }
+        }
+      } catch (e) { /* aborted on disconnect */ }
+    }
+
+    function handleLine(line) {
+      let m;
+      try { m = JSON.parse(line); }
+      catch (e) {
+        /* Loud, not quiet: an unparsable line almost always means a truncated
+           reply, which is exactly the failure that made this page look dead. */
+        log(`✗ unparsable reply (${line.length} bytes) — truncated? ${line.slice(0, 90)}…`, "e");
+        return;
+      }
+      if (m.evt === "input") { renderMonitor(m); updateSticks(m); return; }
+
+      log("← " + line);
+      if (m.cfg) {
+        clearTimeout(getPending);
+        const full = (m.cmd === "PAD_CONFIG.GET" || m.cmd === "PAD_CONFIG.RESET");
+        applyCfgToUI(m.cfg, full);
+        if (m.clamped) log("firmware clamped a value into its usable range", "w");
+      }
+    }
+
+    /* full=true  → authoritative snapshot (GET/RESET): apply everything.
+       full=false → SET echo: only correct fields the user isn't currently editing,
+                    so a late reply can't fight the slider under your finger. */
+    function applyCfgToUI(cfg, full) {
+      SIDES.forEach(side => {
+        STAGES.forEach(st => {
+          const wrap = stageEl(side, st);
+          const ef = enableField(side, st), vf = valueField(side, st);
+          if (ef in cfg) setStageOn(wrap, !!cfg[ef]);
+          if (vf in cfg && (full || !isTouched(vf))) {
+            const r = wrap.querySelector("input[type=range]");
+            const v = wrap.querySelector(".val");
+            const val = cfg[vf];
+            if (!full && parseInt(r.value, 10) !== val) {
+              log(`${side} ${st.label}: firmware reports ${val} (sent ${r.value})`, "w");
+            }
+            r.value = val;
+            v.textContent = st.fmt(val);
+            v.classList.remove("stale");
+          }
+        });
+      });
+      drawAllSticks();
+    }
+
+    /* ---- live monitor -------------------------------------------------------- */
+    function renderMonitor(m) {
+      const pad = (s, n) => String(s).padStart(n);
+      $("#mon").textContent =
+        `LX ${pad(m.lx, 6)}  LY ${pad(m.ly, 6)}   RX ${pad(m.rx, 6)}  RY ${pad(m.ry, 6)}
+LT ${pad(m.lt, 3)}  RT ${pad(m.rt, 3)}
+btn ${Object.entries(m.btn || {}).filter(([k, v]) => v).map(([k]) => k).join(" ") || "—"}`;
+    }
+
+    /* ---- visualiser ----------------------------------------------------------
+       Coordinate space is XInput int16, −32768..32767. R is full scale, and the
+       canvas keeps 1.45 R of headroom so the corner-cap ring is actually visible
+       where it lives: outside the unit circle, out towards the square's corners.
+       That headroom is also the clearest explanation of the 142 ceiling — past
+       that the dashed ring escapes the square entirely and can never be hit.
+       -------------------------------------------------------------------------- */
+    const AX_MAX = 32767;
+    const stickState = { left: { x: 0, y: 0 }, right: { x: 0, y: 0 } };
+
+    function drawStick(canvasId, side) {
+      const cv = document.getElementById(canvasId); if (!cv) return;
+      const ctx = cv.getContext("2d");
+      const W = cv.width, H = cv.height, cx = W / 2, cy = H / 2;
+      const R = (W / 2 - 8) / 1.45;                 // full scale, with corner headroom
+      ctx.clearRect(0, 0, W, H);
+
+      // raw per-axis limit (the square the hardware can actually reach)
+      ctx.strokeStyle = "#1a202a"; ctx.lineWidth = 1;
+      ctx.strokeRect(cx - R, cy - R, 2 * R, 2 * R);
+
+      // full-scale ring + crosshair
+      ctx.strokeStyle = "#2b323f"; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(cx, cy, R, 0, Math.PI * 2); ctx.stroke();
+      ctx.strokeStyle = "#1e2530"; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(cx - R, cy); ctx.lineTo(cx + R, cy);
+      ctx.moveTo(cx, cy - R); ctx.lineTo(cx, cy + R); ctx.stroke();
+
+      // axial deadzone — plus-shaped band. value/128 of full scale per axis.
+      const ax = stageById("axial_deadzone");
+      if (isOn(side, ax) && cfgVal(side, ax) > 0) {
+        const w = Math.min(cfgVal(side, ax) / 128, 1) * R;
+        ctx.fillStyle = "rgba(70,90,130,.22)";
+        ctx.fillRect(cx - w, cy - R, 2 * w, 2 * R);
+        ctx.fillRect(cx - R, cy - w, 2 * R, 2 * w);
+      }
+
+      // radial deadzone — solid disc, same value/128 convention
+      const rd = stageById("radial_deadzone");
+      if (isOn(side, rd) && cfgVal(side, rd) > 0) {
+        const rr = Math.min(cfgVal(side, rd) / 128, 1) * R;
+        ctx.fillStyle = "rgba(70,120,90,.22)";
+        ctx.beginPath(); ctx.arc(cx, cy, rr, 0, Math.PI * 2); ctx.fill();
+      }
+
+      // angular restrict — wedges around each cardinal where the angle collapses
+      const an = stageById("angular_restrict");
+      if (isOn(side, an) && cfgVal(side, an) > 0) {
+        const half = cfgVal(side, an) * Math.PI / 180;
+        ctx.fillStyle = "rgba(91,141,255,.16)";
+        for (let k = 0; k < 4; k++) {
+          const c = k * Math.PI / 2;
+          ctx.beginPath(); ctx.moveTo(cx, cy);
+          ctx.arc(cx, cy, R, c - half, c + half); ctx.closePath(); ctx.fill();
+        }
+      }
+
+      // corner cap — dashed magnitude ceiling, drawn at its true radius
+      const cc = stageById("corner_cap");
+      if (isOn(side, cc) && cfgVal(side, cc) > 0) {
+        ctx.strokeStyle = "rgba(138,107,255,.65)"; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.arc(cx, cy, (cfgVal(side, cc) / 100) * R, 0, Math.PI * 2); ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      // live dot — XInput Y is up-positive, canvas Y is down
+      const s = stickState[side];
+      const px = cx + (s.x / AX_MAX) * R, py = cy - (s.y / AX_MAX) * R;
+      const g = ctx.createRadialGradient(px, py, 0, px, py, 14);
+      g.addColorStop(0, "rgba(62,207,142,.55)"); g.addColorStop(1, "rgba(62,207,142,0)");
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(px, py, 14, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#3ecf8e"; ctx.strokeStyle = "#0d0f14"; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(px, py, 5, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    }
+
+    function drawAllSticks() { drawStick("vizL", "left"); drawStick("vizR", "right"); }
+
+    function updateSticks(m) {
+      stickState.left.x = m.lx; stickState.left.y = m.ly;
+      stickState.right.x = m.rx; stickState.right.y = m.ry;
+      $("#coordL").textContent = m.lx + ", " + m.ly;
+      $("#coordR").textContent = m.rx + ", " + m.ry;
+      drawAllSticks();
+    }
+
+    /* ---- buttons ------------------------------------------------------------- */
+    $("#connect").addEventListener("click", () => {
+      if (!navigator.serial) { log("✗ WebSerial unsupported — use Chrome, Edge or Opera", "e"); return; }
+      connect();
+    });
+    $("#disconnect").addEventListener("click", disconnect);
+
+    $("#reset").addEventListener("click", () => {
+      /* The firmware owns the defaults (PAD_CONFIG_DEFAULTS) and echoes the result,
+         so there is no second copy of the default table to keep in sync here. */
+      sendCmd({ cmd: "PAD_CONFIG.RESET" });
+    });
+
+    $("#xinput").addEventListener("click", async () => {
+      /* The pad acks, reboots, and re-enumerates as a wired Xbox 360 controller —
+         so this serial port vanishing is the success path. Unplug and replug to
+         get back into config mode. */
+      switchingMode = true;
+      log("Switching to Xbox mode. The pad reboots and this port drops — that's expected.", "g");
+      await sendCmd({ cmd: "MODE.SET", mode: "XINPUT" });
+      setTimeout(() => { switchingMode = false; disconnect(); }, 400);
+    });
+
+    $("#stream").addEventListener("click", () => {
+      streaming = !streaming;
+      $("#stream").textContent = streaming ? "Stop stream" : "Start stream";
+      sendCmd({ cmd: "INPUT.STREAM", enable: streaming });
+    });
+
+    setConn(false);
+    drawAllSticks();
+    if (!navigator.serial) log("WebSerial not available in this browser.", "e");
+  </script>
+</body>
+
+</html>

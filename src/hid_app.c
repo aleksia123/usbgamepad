@@ -58,6 +58,14 @@
 #include "host/usbh.h"
 #include "xinput_host.h"
 #include "tusb_gamepad.h"
+#include "pad_config.h"
+#include "square_to_circle.h"
+#include "axial_deadzone.h"
+#include "radial_deadzone.h"
+#include "angular_restrict.h"
+#include "corner_cap.h"
+#include "output_scale.h"
+#include "dither.h"
 
 //--------------------------------------------------------------------+
 // State
@@ -140,15 +148,84 @@ static void process_xinput(const xinput_gamepad_t* p)
     if (p->wButtons & XINPUT_GAMEPAD_GUIDE) btns.sys   = 1;
     if (p->wButtons & XINPUT_GAMEPAD_SHARE) btns.misc  = 1;
 
-    // Triggers (already 0..255)
-    trig.l = p->bLeftTrigger;
-    trig.r = p->bRightTrigger;
-
     // Thumbsticks (already int16, same convention)
     joy.lx = p->sThumbLX;
     joy.ly = p->sThumbLY;
     joy.rx = p->sThumbRX;
     joy.ry = p->sThumbRY;
+
+    const pad_config_t* cfg = &g_pad_config;
+
+    // One clock for both sticks, so they oscillate in step rather than beating
+    // against each other. Derived from wall time, not from a report counter,
+    // so the dither frequency is independent of the pad's polling rate.
+    const bool dither_phase =
+        ((board_millis() / DITHER_HALF_PERIOD_MS) & 1u) != 0u;
+
+    // LEFT (movement): square->circle -> per-axis pre-clean -> circular
+    // deadzone -> angular restriction (cardinal snap) -> corner cap -> output
+    // scale. Each stage is
+    // independently toggled; its slider value is kept even while disabled.
+    // First: correct a square-remapped gate, since every stage below assumes
+    // a circular one.
+    if (cfg->left_stick_square_to_circle_enabled) {
+        square_to_circle_s16(&joy.lx, &joy.ly, cfg->left_stick_square_to_circle_pct);
+    }
+    if (cfg->left_stick_axial_deadzone_enabled) {
+        joy.lx = axial_deadzone_s16(joy.lx, (uint16_t)cfg->left_stick_axial_deadzone * 256);
+        joy.ly = axial_deadzone_s16(joy.ly, (uint16_t)cfg->left_stick_axial_deadzone * 256);
+    }
+    if (cfg->left_stick_radial_deadzone_enabled) {
+        radial_deadzone_s16(&joy.lx, &joy.ly,
+                             (uint16_t)cfg->left_stick_radial_deadzone * 256);
+    }
+    if (cfg->left_stick_angular_restrict_enabled) {
+        angular_restrict_s16(&joy.lx, &joy.ly, cfg->left_stick_angular_restrict_deg);
+    }
+    if (cfg->left_stick_corner_cap_enabled) {
+        apply_corner_cap_s16(&joy.lx, &joy.ly, cfg->left_stick_corner_cap_pct);
+    }
+    // Last: decides what the game sees as maximum stick (see output_scale.h).
+    if (cfg->left_stick_output_scale_enabled) {
+        output_scale_s16(&joy.lx, &joy.ly, cfg->left_stick_output_scale_pct);
+    }
+    // Absolutely last: anything after this would reshape the oscillation.
+    if (cfg->left_stick_dither_enabled) {
+        dither_s16(&joy.lx, &joy.ly, cfg->left_stick_dither_amp_deg10, dither_phase);
+    }
+
+    // RIGHT (look): same pipeline. Angular restriction a few degrees clips
+    // the R2P Y-bulge; corner cap bounds the diagonal overshoot.
+    if (cfg->right_stick_square_to_circle_enabled) {
+        square_to_circle_s16(&joy.rx, &joy.ry, cfg->right_stick_square_to_circle_pct);
+    }
+    if (cfg->right_stick_axial_deadzone_enabled) {
+        joy.rx = axial_deadzone_s16(joy.rx, (uint16_t)cfg->right_stick_axial_deadzone * 256);
+        joy.ry = axial_deadzone_s16(joy.ry, (uint16_t)cfg->right_stick_axial_deadzone * 256);
+    }
+    if (cfg->right_stick_radial_deadzone_enabled) {
+        radial_deadzone_s16(&joy.rx, &joy.ry,
+                             (uint16_t)cfg->right_stick_radial_deadzone * 256);
+    }
+    if (cfg->right_stick_angular_restrict_enabled) {
+        angular_restrict_s16(&joy.rx, &joy.ry, cfg->right_stick_angular_restrict_deg);
+    }
+    if (cfg->right_stick_corner_cap_enabled) {
+        apply_corner_cap_s16(&joy.rx, &joy.ry, cfg->right_stick_corner_cap_pct);
+    }
+    // Last: at 96 this keeps Infinite's Max Input Threshold out of reach, so
+    // look Acceleration never engages and you aim on the base curve alone.
+    if (cfg->right_stick_output_scale_enabled) {
+        output_scale_s16(&joy.rx, &joy.ry, cfg->right_stick_output_scale_pct);
+    }
+    if (cfg->right_stick_dither_enabled) {
+        dither_s16(&joy.rx, &joy.ry, cfg->right_stick_dither_amp_deg10, dither_phase);
+    }
+
+    // Triggers: raw passthrough, 8-bit in, 8-bit out - normal controller
+    // operation, not a tunable stage (trigger_utils.h removed).
+    trig.l = p->bLeftTrigger;
+    trig.r = p->bRightTrigger;
 
     // Commit to shared gamepad — no zero window visible to core 0
     gp->buttons   = btns;
