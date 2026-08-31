@@ -34,7 +34,7 @@ internal static class Program
         int? index = null;
         double seconds = 8.0;
         bool secondsSet = false;
-        bool list = false, dump = false, xinput = false, noFilter = false, decode = false;
+        bool list = false, dump = false, xinput = false, noFilter = false, decode = false, map = false;
         uint xinputIndex = 0;
 
         try
@@ -52,6 +52,7 @@ internal static class Program
                     case "--list": list = true; break;
                     case "--dump": dump = true; break;
                     case "--decode": decode = true; break;
+                    case "--map": map = true; break;
                     case "--xinput":
                         xinput = true;
                         if (i + 1 < args.Length && uint.TryParse(args[i + 1], out uint xi)) { xinputIndex = xi; i++; }
@@ -130,6 +131,7 @@ internal static class Program
             return 2;
         }
 
+        if (map) return MapReports(device);
         // --dump runs until Ctrl+C unless a window was requested explicitly.
         return dump ? DumpReports(device, secondsSet ? seconds : 0) : ProbeRate(device, seconds);
     }
@@ -142,6 +144,8 @@ internal static class Program
             Modes (default: rate probe of the raw HID node):
               --list           list matching HID nodes and exit
               --dump           hex-dump reports, marking bytes that changed (mapping harness)
+              --map            guided per-control byte mapper: hold one control per prompt,
+                               prints a paste-ready MAP SUMMARY of true byte offsets
               --decode         live-decode via the descriptor-driven reader; prints a
                                paste-ready DECODE SUMMARY on exit (Step 2 validation)
               --xinput [n]     probe via XInputGetState(n) instead of raw HID (default pad 0)
@@ -469,6 +473,128 @@ internal static class Program
                 tPrev = t;
                 havePrev = true;
             }
+        }
+        return 0;
+    }
+
+    // ------------------------------------------------------------------ //
+    //  Map mode - derive TRUE byte offsets per control from the wire.
+    //  Needed because Windows' reconstructed descriptor can misplace field
+    //  offsets (caps APIs don't expose real bit positions), which shows up
+    //  as tiny axis ranges / a frozen Z / a dead hat in --decode.
+    // ------------------------------------------------------------------ //
+
+    private static readonly string[] s_mapSteps =
+    {
+        "REST: touch nothing, sticks centered",
+        "hold LEFT stick fully LEFT",
+        "hold LEFT stick fully RIGHT",
+        "hold LEFT stick fully UP",
+        "hold LEFT stick fully DOWN",
+        "hold RIGHT stick fully LEFT",
+        "hold RIGHT stick fully RIGHT",
+        "hold RIGHT stick fully UP",
+        "hold RIGHT stick fully DOWN",
+        "hold LEFT trigger fully pressed",
+        "hold RIGHT trigger fully pressed",
+        "hold DPAD UP",
+        "hold DPAD RIGHT",
+        "hold button A",
+    };
+
+    private static int MapReports(HidDevice device)
+    {
+        Console.WriteLine($"Mapping: {device.DevicePath}");
+        if (!TryOpen(device, out var stream)) return 3;
+
+        using (stream)
+        {
+            stream.ReadTimeout = 200;
+            int len = SafeMaxInputLength(device);
+            var latest = new byte[len];
+            bool haveLatest = false;
+            string? readError = null;
+            bool stopReader = false;
+            var latestLock = new object();
+
+            var readerThread = new Thread(() =>
+            {
+                var tmp = new byte[len];
+                while (!Volatile.Read(ref stopReader))
+                {
+                    int n;
+                    try { n = stream.Read(tmp, 0, tmp.Length); }
+                    catch (TimeoutException) { continue; }
+                    catch (Exception ex) { readError = ex.Message; break; }
+                    if (n <= 0) continue;
+                    lock (latestLock) { Array.Copy(tmp, latest, len); haveLatest = true; }
+                }
+            })
+            { IsBackground = true, Name = "map-reader" };
+            readerThread.Start();
+
+            Console.WriteLine();
+            Console.WriteLine("For each prompt: do EXACTLY that and NOTHING else, KEEP HOLDING it,");
+            Console.WriteLine("and press Enter while still holding. (Enter also gets past Ctrl+C.)");
+            Console.WriteLine();
+
+            var snaps = new byte[s_mapSteps.Length][];
+            for (int i = 0; i < s_mapSteps.Length && !s_stop; i++)
+            {
+                Console.Write($"[{i + 1}/{s_mapSteps.Length}] {s_mapSteps[i]}  ->  Enter: ");
+                if (Console.ReadLine() is null)
+                {
+                    Console.Error.WriteLine("--map needs an interactive console (stdin is redirected).");
+                    break;
+                }
+                lock (latestLock)
+                {
+                    if (haveLatest) snaps[i] = (byte[])latest.Clone();
+                }
+                if (snaps[i] is null) Console.WriteLine("   (no report received yet - wiggle once, redo this step)");
+                if (readError is not null)
+                {
+                    Console.Error.WriteLine($"read failed: {readError}");
+                    break;
+                }
+            }
+
+            Volatile.Write(ref stopReader, true);
+            readerThread.Join(1000);
+
+            Console.WriteLine();
+            Console.WriteLine("==== MAP SUMMARY (paste this whole block back) ====");
+            var baseline = snaps[0];
+            if (baseline is null)
+            {
+                Console.WriteLine("no baseline captured - rerun and wiggle a stick once before step 1.");
+                Console.WriteLine("===================================================");
+                return 2;
+            }
+
+            Console.WriteLine($"report length: {len} bytes (byte 0 = report id 0x{baseline[0]:X2})");
+            Console.WriteLine($"baseline: {Hex(baseline, len, len)}");
+            for (int i = 1; i < s_mapSteps.Length; i++)
+            {
+                var snap = snaps[i];
+                Console.Write($"{s_mapSteps[i],-33}: ");
+                if (snap is null) { Console.WriteLine("(no data)"); continue; }
+
+                var byteChanges = new List<string>();
+                for (int b = 0; b < len; b++)
+                    if (snap[b] != baseline[b])
+                        byteChanges.Add($"b{b:d2} {baseline[b]:X2}->{snap[b]:X2}");
+                if (byteChanges.Count == 0) { Console.WriteLine("no change"); continue; }
+                Console.WriteLine(string.Join("  ", byteChanges));
+
+                var wordChanges = new List<string>();
+                for (int b = 0; b + 1 < len; b += 2)
+                    if (snap[b] != baseline[b] || snap[b + 1] != baseline[b + 1])
+                        wordChanges.Add($"u16@{b:d2} {baseline[b] | (baseline[b + 1] << 8)}->{snap[b] | (snap[b + 1] << 8)}");
+                if (wordChanges.Count > 0)
+                    Console.WriteLine($"{new string(' ', 35)}{string.Join("  ", wordChanges)}");
+            }
+            Console.WriteLine("===================================================");
         }
         return 0;
     }

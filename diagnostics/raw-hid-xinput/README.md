@@ -126,6 +126,18 @@ interface would have to be added alongside it.
   cable/hub stays visible in the Logs panel. (`RawHidGamepadReader` exposes
   the same via `GetRateStats()`.)
 
+## Known issue: reconstructed field offsets can be wrong
+
+A real `--decode` run on this pad showed buttons and rate perfect but tiny
+stick ranges, a Z frozen through full trigger pulls, and a silent hat: the
+descriptor Windows lets HidSharp reconstruct doesn't carry the true
+in-report bit positions, so values can be extracted from the wrong offsets
+(same root cause family as the degenerate ranges). The remedy is the
+probe's `--map` mode: one guided run (hold one control per prompt) prints a
+`MAP SUMMARY` of the actual byte offsets per control, from which a
+verified fixed-offset decode gets wired into the reader and provider (the
+descriptor-driven path stays as the fallback for other devices).
+
 ## Caveats to design for
 
 * **Combined triggers — CONFIRMED on this pad.** The IG_00 collection
