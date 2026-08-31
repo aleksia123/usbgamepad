@@ -9,9 +9,12 @@ GitHub account this session can see), so the work is staged here as
 drop-in files plus a live validation harness:
 
 * `RawHidXInputProvider.cs` — the **finished ReflexX provider** (see below).
+  It does **not** compile in this repo, by design: it needs ReflexX's types.
+  It is stored here to be **copied out** into the ReflexX solution.
 * `RawHidGamepadReader.cs` — the same decode as a standalone, ReflexX-free
-  class; it powers the probe's `--decode` harness and remains useful for
-  any other consumer.
+  class; the probe project compiles this one (and only this one) for
+  `--decode`. Leave both files exactly where they are — don't paste one
+  into the other.
 
 ## What's here
 

@@ -1,3 +1,12 @@
+// *** DO NOT BUILD THIS FILE IN THIS REPO - IT WILL NOT COMPILE HERE ***
+// It needs ReflexX's types (IInputProvider, GamepadState, InputDevice,
+// GamepadButton, ILogger<>), so it compiles only inside the ReflexX
+// solution. To use it: COPY this file into the ReflexX project folder that
+// holds XinputAppTransport.cs and change the `namespace` line below to that
+// file's namespace. Never paste it into/over RawHidGamepadReader.cs - that
+// is a different, standalone class which the hid-rate-probe project
+// compiles for --decode; replacing it breaks the probe build.
+//
 // RawHidXInputProvider - IInputProvider that reads the physical pad's
 // XInput-compatible HID collection (HID\VID_3537&PID_10C5&IG_00) directly,
 // bypassing XInputGetState's ~125 Hz host-side cache (plan Step 2).
