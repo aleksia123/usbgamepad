@@ -15,6 +15,7 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 using HidSharp;
+using RawHidXInput;
 
 internal static class Program
 {
@@ -33,7 +34,7 @@ internal static class Program
         int? index = null;
         double seconds = 8.0;
         bool secondsSet = false;
-        bool list = false, dump = false, xinput = false, noFilter = false;
+        bool list = false, dump = false, xinput = false, noFilter = false, decode = false;
         uint xinputIndex = 0;
 
         try
@@ -50,6 +51,7 @@ internal static class Program
                     case "--seconds": seconds = double.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); secondsSet = true; break;
                     case "--list": list = true; break;
                     case "--dump": dump = true; break;
+                    case "--decode": decode = true; break;
                     case "--xinput":
                         xinput = true;
                         if (i + 1 < args.Length && uint.TryParse(args[i + 1], out uint xi)) { xinputIndex = xi; i++; }
@@ -75,6 +77,9 @@ internal static class Program
 
         if (xinput)
             return ProbeXInput(xinputIndex, seconds);
+
+        if (decode)
+            return DecodeLive(vid, pid, noFilter ? "" : filter, secondsSet ? seconds : 0);
 
         var candidates = DeviceList.Local.GetHidDevices(vid, pid).ToList();
         if (candidates.Count == 0)
@@ -137,6 +142,7 @@ internal static class Program
             Modes (default: rate probe of the raw HID node):
               --list           list matching HID nodes and exit
               --dump           hex-dump reports, marking bytes that changed (mapping harness)
+              --decode         live-decode via the descriptor-driven reader (Step 2 validation)
               --xinput [n]     probe via XInputGetState(n) instead of raw HID (default pad 0)
 
             Selection (raw HID modes):
@@ -463,6 +469,61 @@ internal static class Program
                 havePrev = true;
             }
         }
+        return 0;
+    }
+
+    // ------------------------------------------------------------------ //
+    //  Decode mode - live view through the Step-2 RawHidGamepadReader
+    // ------------------------------------------------------------------ //
+
+    private static int DecodeLive(int vid, int pid, string filter, double seconds)
+    {
+        Console.WriteLine($"Live decode of VID=0x{vid:X4} PID=0x{pid:X4} filter=\"{filter}\"");
+        Console.WriteLine("via RawHidGamepadReader (descriptor-driven). Ctrl+C to stop.");
+        Console.WriteLine("Check that every control maps sensibly and full range is reached.");
+        Console.WriteLine();
+
+        using var reader = new RawHidGamepadReader(vid, pid, filter);
+        reader.Status += msg => Console.WriteLine($"\n[reader] {msg}");
+        reader.Start();
+
+        bool timed = seconds > 0;
+        long freq = Stopwatch.Frequency;
+        long tEnd = Stopwatch.GetTimestamp() + (long)(seconds * freq);
+        long lastStatsAt = Stopwatch.GetTimestamp();
+        RateStats? rate = null;
+        int prevLen = 0;
+
+        while (!s_stop && !(timed && Stopwatch.GetTimestamp() >= tEnd))
+        {
+            Thread.Sleep(50);
+            long now = Stopwatch.GetTimestamp();
+            if (now - lastStatsAt >= freq)
+            {
+                rate = reader.GetRateStats();
+                lastStatsAt = now;
+            }
+            if (!reader.IsConnected) continue;
+
+            var st = reader.LastState;
+            string dpad =
+                (st.Dpad.HasFlag(RawDpad.Up) ? "U" : "-") +
+                (st.Dpad.HasFlag(RawDpad.Down) ? "D" : "-") +
+                (st.Dpad.HasFlag(RawDpad.Left) ? "L" : "-") +
+                (st.Dpad.HasFlag(RawDpad.Right) ? "R" : "-");
+            string line =
+                $"LX{st.LeftX,7} LY{st.LeftY,7} RX{st.RightX,7} RY{st.RightY,7}  " +
+                $"LT{st.LeftTrigger,6} RT{st.RightTrigger,6}  BTN 0x{st.Buttons:X4} DPAD {dpad}  " +
+                $"| {(rate == null ? "measuring..." : rate.ToString())}";
+            Console.Write("\r" + line.PadRight(Math.Max(prevLen, line.Length)));
+            prevLen = line.Length;
+        }
+        Console.WriteLine();
+
+        var final = reader.GetRateStats();
+        Console.WriteLine();
+        Console.WriteLine($"Layout: {reader.LayoutDescription ?? "(never connected)"}");
+        Console.WriteLine($"Total reports decoded: {final.TotalReports}");
         return 0;
     }
 

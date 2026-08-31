@@ -14,4 +14,10 @@
     <PackageReference Include="HidSharp" Version="2.1.0" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- The Step-2 reader core lives next door so ReflexX can take the file
+         verbatim; compiling it here keeps it verified and drives -decode. -->
+    <Compile Include="..\raw-hid-xinput\RawHidGamepadReader.cs" Link="RawHidGamepadReader.cs" />
+  </ItemGroup>
+
 </Project>

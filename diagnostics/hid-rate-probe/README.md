@@ -42,7 +42,16 @@ dotnet run -- --xinput
 
 # 4. (Only if step 2 says the cap is real) peek at the vendor collection:
 dotnet run -- --dump --filter col04
+
+# 5. (After a FAST verdict) validate the plan-Step-2 reader core live:
+dotnet run -- --decode
 ```
+
+`--decode` runs `../raw-hid-xinput/RawHidGamepadReader.cs` — the
+descriptor-driven reader destined for ReflexX — and shows decoded axes,
+buttons, dpad and the achieved rate in real time. See
+`../raw-hid-xinput/README.md` for the validation checklist and integration
+guide.
 
 HID interrupt reports are only delivered when the report content *changes* —
 an untouched pad produces silence, which the tool reports as timeouts. Keep
