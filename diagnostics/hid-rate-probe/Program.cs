@@ -502,6 +502,12 @@ internal static class Program
         "hold button A",
     };
 
+    // The stick block on this pad sits at LE u16 offsets 1/3/5/7 (byte 0 is
+    // the report id); print it decoded so rails are visible at a glance.
+    private static string AxesAtOdd(byte[] report, int len) => len >= 9
+        ? $"axes@1/3/5/7: {report[1] | (report[2] << 8),5} {report[3] | (report[4] << 8),5} {report[5] | (report[6] << 8),5} {report[7] | (report[8] << 8),5}"
+        : "";
+
     private static int MapReports(HidDevice device)
     {
         Console.WriteLine($"Mapping: {device.DevicePath}");
@@ -534,24 +540,33 @@ internal static class Program
             readerThread.Start();
 
             Console.WriteLine();
-            Console.WriteLine("For each prompt: do EXACTLY that and NOTHING else, KEEP HOLDING it,");
-            Console.WriteLine("and press Enter while still holding. (Enter also gets past Ctrl+C.)");
+            Console.WriteLine("Flow per step: press Enter FIRST (hands free), THEN do the action and");
+            Console.WriteLine("HOLD it for the whole 3-second countdown, releasing only after");
+            Console.WriteLine("\"captured\" appears. Do nothing else with the pad during a countdown.");
             Console.WriteLine();
 
             var snaps = new byte[s_mapSteps.Length][];
             for (int i = 0; i < s_mapSteps.Length && !s_stop; i++)
             {
-                Console.Write($"[{i + 1}/{s_mapSteps.Length}] {s_mapSteps[i]}  ->  Enter: ");
+                Console.Write($"[{i + 1}/{s_mapSteps.Length}] NEXT: {s_mapSteps[i]}   ->  Enter to arm: ");
                 if (Console.ReadLine() is null)
                 {
                     Console.Error.WriteLine("--map needs an interactive console (stdin is redirected).");
                     break;
                 }
+                Console.Write("    HOLD IT NOW ");
+                for (int tick = 0; tick < 30 && !s_stop; tick++)
+                {
+                    Thread.Sleep(100);
+                    if (tick % 5 == 4) Console.Write(".");
+                }
                 lock (latestLock)
                 {
                     if (haveLatest) snaps[i] = (byte[])latest.Clone();
                 }
-                if (snaps[i] is null) Console.WriteLine("   (no report received yet - wiggle once, redo this step)");
+                Console.WriteLine(snaps[i] is null
+                    ? "  no report received yet - wiggle a stick once and redo this step"
+                    : "  captured - release.");
                 if (readError is not null)
                 {
                     Console.Error.WriteLine($"read failed: {readError}");
@@ -574,6 +589,7 @@ internal static class Program
 
             Console.WriteLine($"report length: {len} bytes (byte 0 = report id 0x{baseline[0]:X2})");
             Console.WriteLine($"baseline: {Hex(baseline, len, len)}");
+            Console.WriteLine($"baseline {AxesAtOdd(baseline, len)}");
             for (int i = 1; i < s_mapSteps.Length; i++)
             {
                 var snap = snaps[i];
@@ -587,14 +603,18 @@ internal static class Program
                 if (byteChanges.Count == 0) { Console.WriteLine("no change"); continue; }
                 Console.WriteLine(string.Join("  ", byteChanges));
 
+                // Both alignments: fields sit at odd offsets on this pad, so
+                // pair every changed byte with its neighbor.
                 var wordChanges = new List<string>();
-                for (int b = 0; b + 1 < len; b += 2)
+                for (int b = 0; b + 1 < len; b++)
                     if (snap[b] != baseline[b] || snap[b + 1] != baseline[b + 1])
                         wordChanges.Add($"u16@{b:d2} {baseline[b] | (baseline[b + 1] << 8)}->{snap[b] | (snap[b + 1] << 8)}");
                 if (wordChanges.Count > 0)
                     Console.WriteLine($"{new string(' ', 35)}{string.Join("  ", wordChanges)}");
+                Console.WriteLine($"{new string(' ', 35)}{AxesAtOdd(snap, len)}");
             }
             Console.WriteLine("===================================================");
+            Console.WriteLine("Paste EVERYTHING between the ==== lines, including the baseline lines.");
         }
         return 0;
     }
