@@ -1,0 +1,554 @@
+// HidRateProbe - throwaway diagnostic for the "125 Hz ceiling" question.
+//
+// Measures how fast input reports actually arrive from a HID device node,
+// by blocking-reading it directly (HidSharp -> ReadFile) and timestamping
+// every returned report. Run it against the physical pad's XInput HID
+// collection (HID\VID_3537&PID_10C5&IG_00) while wiggling a stick
+// continuously, and compare against the XInputGetState path (--xinput).
+//
+// See README.md next to this file for how to interpret the numbers.
+//
+// Windows-only in practice (IG_00 / xinput1_4.dll are Windows concepts),
+// though the raw HID modes build and run anywhere HidSharp supports.
+
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text;
+using HidSharp;
+
+internal static class Program
+{
+    // Defaults: BIGBIG WON Rainbow 2 Pro (XInput mode), XInput-compatible HID collection.
+    private const int DefaultVid = 0x3537;
+    private const int DefaultPid = 0x10C5;
+    private const string DefaultPathFilter = "ig_00";
+
+    private static volatile bool s_stop;
+
+    private static int Main(string[] args)
+    {
+        int vid = DefaultVid;
+        int pid = DefaultPid;
+        string filter = DefaultPathFilter;
+        int? index = null;
+        double seconds = 8.0;
+        bool secondsSet = false;
+        bool list = false, dump = false, xinput = false, noFilter = false;
+        uint xinputIndex = 0;
+
+        try
+        {
+            for (int i = 0; i < args.Length; i++)
+            {
+                switch (args[i])
+                {
+                    case "--vid": vid = ParseId(args[++i]); break;
+                    case "--pid": pid = ParseId(args[++i]); break;
+                    case "--filter": filter = args[++i]; break;
+                    case "--no-filter": noFilter = true; break;
+                    case "--index": index = int.Parse(args[++i]); break;
+                    case "--seconds": seconds = double.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); secondsSet = true; break;
+                    case "--list": list = true; break;
+                    case "--dump": dump = true; break;
+                    case "--xinput":
+                        xinput = true;
+                        if (i + 1 < args.Length && uint.TryParse(args[i + 1], out uint xi)) { xinputIndex = xi; i++; }
+                        break;
+                    case "--help": case "-h": case "/?":
+                        PrintUsage();
+                        return 0;
+                    default:
+                        Console.Error.WriteLine($"Unknown argument: {args[i]}");
+                        PrintUsage();
+                        return 1;
+                }
+            }
+        }
+        catch (Exception ex) when (ex is IndexOutOfRangeException or FormatException or OverflowException)
+        {
+            Console.Error.WriteLine("Bad or missing argument value.");
+            PrintUsage();
+            return 1;
+        }
+
+        Console.CancelKeyPress += (_, e) => { e.Cancel = true; s_stop = true; };
+
+        if (xinput)
+            return ProbeXInput(xinputIndex, seconds);
+
+        var candidates = DeviceList.Local.GetHidDevices(vid, pid).ToList();
+        if (candidates.Count == 0)
+        {
+            Console.Error.WriteLine($"No HID devices found for VID=0x{vid:X4} PID=0x{pid:X4}.");
+            Console.Error.WriteLine("Is the pad plugged in DIRECTLY (not through the Pico) and in the expected mode?");
+            return 2;
+        }
+
+        if (list)
+        {
+            Console.WriteLine($"HID device nodes for VID=0x{vid:X4} PID=0x{pid:X4}:");
+            ListDevices(candidates);
+            return 0;
+        }
+
+        var filtered = noFilter || filter.Length == 0
+            ? candidates
+            : candidates.Where(d => d.DevicePath.Contains(filter, StringComparison.OrdinalIgnoreCase)).ToList();
+
+        if (filtered.Count == 0)
+        {
+            Console.Error.WriteLine($"No device path contains \"{filter}\". All nodes for VID=0x{vid:X4} PID=0x{pid:X4}:");
+            ListDevices(candidates);
+            Console.Error.WriteLine("Pick one with --filter <substring> or --index <n> (with --no-filter).");
+            return 2;
+        }
+
+        HidDevice device;
+        if (index is int idx)
+        {
+            if (idx < 0 || idx >= filtered.Count)
+            {
+                Console.Error.WriteLine($"--index {idx} out of range; matching nodes:");
+                ListDevices(filtered);
+                return 2;
+            }
+            device = filtered[idx];
+        }
+        else if (filtered.Count == 1)
+        {
+            device = filtered[0];
+        }
+        else
+        {
+            Console.Error.WriteLine("More than one node matches; choose with --index <n>:");
+            ListDevices(filtered);
+            return 2;
+        }
+
+        // --dump runs until Ctrl+C unless a window was requested explicitly.
+        return dump ? DumpReports(device, secondsSet ? seconds : 0) : ProbeRate(device, seconds);
+    }
+
+    private static void PrintUsage()
+    {
+        Console.WriteLine("""
+            HidRateProbe - measure real inter-report intervals of a HID device node.
+
+            Modes (default: rate probe of the raw HID node):
+              --list           list matching HID nodes and exit
+              --dump           hex-dump reports, marking bytes that changed (mapping harness)
+              --xinput [n]     probe via XInputGetState(n) instead of raw HID (default pad 0)
+
+            Selection (raw HID modes):
+              --vid <hex>      vendor id  (default 3537)
+              --pid <hex>      product id (default 10C5)
+              --filter <s>     substring the device path must contain (default "ig_00")
+              --no-filter      ignore the path filter
+              --index <n>      pick the n-th matching node when several match
+
+            Other:
+              --seconds <n>    measurement window (default 8; --dump default: until Ctrl+C)
+
+            Wiggle a stick CONTINUOUSLY while a probe runs: HID interrupt reports are
+            only delivered when the report content changes.
+            """);
+    }
+
+    private static int ParseId(string s)
+    {
+        s = s.Trim();
+        if (s.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) s = s[2..];
+        return int.Parse(s, System.Globalization.NumberStyles.HexNumber);
+    }
+
+    private static void ListDevices(IReadOnlyList<HidDevice> devices)
+    {
+        for (int i = 0; i < devices.Count; i++)
+        {
+            var d = devices[i];
+            string name, usage;
+            try { name = d.GetProductName(); } catch { name = "?"; }
+            try
+            {
+                int maxIn = d.GetMaxInputReportLength();
+                usage = $"maxInputReport={maxIn}B";
+            }
+            catch { usage = "maxInputReport=?"; }
+
+            string tlc = DescribeTopLevelUsage(d);
+            Console.WriteLine($"  [{i}] {usage}{tlc}  product=\"{name}\"");
+            Console.WriteLine($"      {d.DevicePath}");
+        }
+    }
+
+    private static string DescribeTopLevelUsage(HidDevice d)
+    {
+        try
+        {
+            var usages = d.GetReportDescriptor().DeviceItems
+                .SelectMany(item => item.Usages.GetAllValues())
+                .Distinct()
+                .Select(u =>
+                {
+                    uint page = u >> 16, id = u & 0xFFFF;
+                    string label = (page, id) switch
+                    {
+                        (0x0001, 0x0004) => "GenericDesktop/Joystick",
+                        (0x0001, 0x0005) => "GenericDesktop/Gamepad",
+                        (0x0001, 0x0008) => "GenericDesktop/MultiAxis",
+                        (0x000C, 0x0001) => "Consumer/ConsumerControl",
+                        _ when page >= 0xFF00 => $"Vendor(0x{page:X4}/0x{id:X4})",
+                        _ => $"0x{page:X4}/0x{id:X4}",
+                    };
+                    return label;
+                });
+            string s = string.Join(", ", usages);
+            return s.Length > 0 ? $"  usage={s}" : "";
+        }
+        catch
+        {
+            return ""; // descriptor not readable; not fatal for the probe
+        }
+    }
+
+    // ------------------------------------------------------------------ //
+    //  Raw HID rate probe
+    // ------------------------------------------------------------------ //
+
+    private static int ProbeRate(HidDevice device, double seconds)
+    {
+        Console.WriteLine($"Probing: {device.DevicePath}");
+        if (!TryOpen(device, out var stream)) return 3;
+
+        using (stream)
+        {
+            stream.ReadTimeout = 2000;
+            int bufLen = SafeMaxInputLength(device);
+            var buf = new byte[bufLen];
+
+            Console.WriteLine($"Max input report length: {bufLen} bytes (byte 0 is the report ID).");
+            Console.WriteLine($"Reading for {seconds:0.#} s - WIGGLE A STICK CONTINUOUSLY the whole time...");
+            Console.WriteLine();
+
+            long freq = Stopwatch.Frequency;
+            long tStart = Stopwatch.GetTimestamp();
+            long tWarmupEnd = tStart + (long)(0.5 * freq);
+            long tEnd = tWarmupEnd + (long)(seconds * freq);
+
+            var deltas = new List<double>(1 << 16);
+            long tPrev = 0;
+            bool havePrev = false, firstShown = false;
+            int timeouts = 0, gaps = 0;
+
+            while (!s_stop)
+            {
+                long now = Stopwatch.GetTimestamp();
+                if (now >= tEnd) break;
+
+                int n;
+                try { n = stream.Read(buf, 0, buf.Length); }
+                catch (TimeoutException)
+                {
+                    timeouts++;
+                    havePrev = false;
+                    Console.WriteLine("  ...no report for 2 s (wiggle the stick; make sure this is the right node)");
+                    continue;
+                }
+                catch (IOException ex)
+                {
+                    Console.Error.WriteLine($"Read failed (device unplugged?): {ex.Message}");
+                    break;
+                }
+
+                long t = Stopwatch.GetTimestamp();
+                if (!firstShown)
+                {
+                    firstShown = true;
+                    Console.WriteLine($"First report ({n} bytes): {Hex(buf, n, 32)}");
+                    Console.WriteLine();
+                }
+
+                if (t < tWarmupEnd) { tPrev = t; havePrev = true; continue; } // warm-up: discard
+
+                if (havePrev)
+                {
+                    double ms = (t - tPrev) * 1000.0 / freq;
+                    if (ms <= 100.0) deltas.Add(ms);
+                    else gaps++; // pause in input, not a polling interval
+                }
+                tPrev = t;
+                havePrev = true;
+            }
+
+            PrintStats("raw HID reads", deltas, timeouts, gaps);
+
+            if (deltas.Count >= 20)
+            {
+                double median = Percentile(deltas, 50);
+                Console.WriteLine();
+                if (median <= 2.0)
+                    Console.WriteLine(
+                        "VERDICT: the endpoint/collection is FAST. The ~125 Hz seen through\n" +
+                        "XInputGetState is host-side software throttling, not the device.\n" +
+                        "=> A raw-HID reader on this node already gets the fast path (plan Step 2).");
+                else if (median >= 6.0)
+                    Console.WriteLine(
+                        "VERDICT: the ~125 Hz cap is REAL at this interface - reading it raw\n" +
+                        "does not go faster. The fast mode, if any, lives on another\n" +
+                        "collection (e.g. the vendor-defined MI_01&COL04) (plan Step 4).");
+                else
+                    Console.WriteLine(
+                        "VERDICT: intermediate rate - faster than the 125 Hz XInput path but\n" +
+                        "not 1 kHz. Raw reads still help (Step 2); compare with --xinput and\n" +
+                        "consider probing the vendor collection too (Step 4).");
+            }
+            else
+            {
+                Console.WriteLine();
+                Console.WriteLine("Too few samples for a verdict. Wiggle continuously for the whole run,");
+                Console.WriteLine("and check --list output to confirm the node (pad in XInput mode?).");
+            }
+        }
+        return 0;
+    }
+
+    // ------------------------------------------------------------------ //
+    //  XInputGetState comparison probe
+    // ------------------------------------------------------------------ //
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct XINPUT_GAMEPAD
+    {
+        public ushort wButtons;
+        public byte bLeftTrigger, bRightTrigger;
+        public short sThumbLX, sThumbLY, sThumbRX, sThumbRY;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct XINPUT_STATE
+    {
+        public uint dwPacketNumber;
+        public XINPUT_GAMEPAD Gamepad;
+    }
+
+    [DllImport("xinput1_4.dll")]
+    private static extern uint XInputGetState(uint dwUserIndex, out XINPUT_STATE state);
+
+    private const uint ERROR_DEVICE_NOT_CONNECTED = 1167;
+
+    private static int ProbeXInput(uint padIndex, double seconds)
+    {
+        Console.WriteLine($"Probing XInputGetState(pad {padIndex}) - spinning as fast as possible,");
+        Console.WriteLine("timestamping every dwPacketNumber change.");
+        Console.WriteLine($"Reading for {seconds:0.#} s - WIGGLE A STICK CONTINUOUSLY the whole time...");
+        Console.WriteLine();
+
+        try
+        {
+            if (XInputGetState(padIndex, out _) == ERROR_DEVICE_NOT_CONNECTED)
+            {
+                Console.Error.WriteLine($"XInput pad {padIndex} is not connected.");
+                return 2;
+            }
+        }
+        catch (DllNotFoundException)
+        {
+            Console.Error.WriteLine("xinput1_4.dll not found - this mode only works on Windows.");
+            return 3;
+        }
+
+        long freq = Stopwatch.Frequency;
+        long tStart = Stopwatch.GetTimestamp();
+        long tWarmupEnd = tStart + (long)(0.5 * freq);
+        long tEnd = tWarmupEnd + (long)(seconds * freq);
+
+        var deltas = new List<double>(1 << 16);
+        uint lastPacket = 0;
+        long tPrev = 0;
+        bool havePrev = false;
+        int gaps = 0;
+        long polls = 0;
+
+        while (!s_stop)
+        {
+            long now = Stopwatch.GetTimestamp();
+            if (now >= tEnd) break;
+
+            polls++;
+            if (XInputGetState(padIndex, out var st) != 0) { havePrev = false; continue; }
+            if (havePrev && st.dwPacketNumber == lastPacket) continue;
+
+            long t = Stopwatch.GetTimestamp();
+            if (t >= tWarmupEnd && havePrev)
+            {
+                double ms = (t - tPrev) * 1000.0 / freq;
+                if (ms <= 100.0) deltas.Add(ms);
+                else gaps++;
+            }
+            lastPacket = st.dwPacketNumber;
+            tPrev = t;
+            havePrev = true;
+        }
+
+        Console.WriteLine($"({polls / Math.Max(seconds, 0.001):0} XInputGetState calls/s sampling rate)");
+        PrintStats("XInput state changes", deltas, 0, gaps);
+        Console.WriteLine();
+        Console.WriteLine("Compare the modal interval here with the raw-HID probe run on the");
+        Console.WriteLine("same pad: identical => the raw node is just as slow; raw much faster");
+        Console.WriteLine("=> the cap lives in the XInput driver stack, not the device.");
+        return 0;
+    }
+
+    // ------------------------------------------------------------------ //
+    //  Dump mode (byte-mapping harness for undocumented reports)
+    // ------------------------------------------------------------------ //
+
+    private static int DumpReports(HidDevice device, double seconds)
+    {
+        Console.WriteLine($"Dumping: {device.DevicePath}");
+        if (!TryOpen(device, out var stream)) return 3;
+
+        using (stream)
+        {
+            stream.ReadTimeout = 1000;
+            int bufLen = SafeMaxInputLength(device);
+            var buf = new byte[bufLen];
+            var prev = new byte[bufLen];
+            int prevLen = -1;
+
+            bool timed = seconds > 0;
+            long tEnd = Stopwatch.GetTimestamp() + (long)(seconds * Stopwatch.Frequency);
+            Console.WriteLine(timed
+                ? $"Printing reports whose content changed, for {seconds:0.#} s."
+                : "Printing reports whose content changed. Ctrl+C to stop.");
+            Console.WriteLine("Move ONE control at a time to see which bytes it owns.");
+            Console.WriteLine();
+            Console.WriteLine("        idx  " + string.Join(" ", Enumerable.Range(0, bufLen).Select(i => $"{i:d2}")));
+
+            long tPrev = 0;
+            bool havePrev = false;
+            long freq = Stopwatch.Frequency;
+
+            while (!s_stop && !(timed && Stopwatch.GetTimestamp() >= tEnd))
+            {
+                int n;
+                try { n = stream.Read(buf, 0, buf.Length); }
+                catch (TimeoutException) { continue; }
+                catch (IOException ex)
+                {
+                    Console.Error.WriteLine($"Read failed (device unplugged?): {ex.Message}");
+                    break;
+                }
+
+                long t = Stopwatch.GetTimestamp();
+                bool changed = n != prevLen || !buf.AsSpan(0, n).SequenceEqual(prev.AsSpan(0, n));
+                if (changed)
+                {
+                    double ms = havePrev ? (t - tPrev) * 1000.0 / freq : 0;
+                    var hex = new StringBuilder();
+                    var marks = new StringBuilder();
+                    for (int i = 0; i < n; i++)
+                    {
+                        hex.Append($"{buf[i]:X2} ");
+                        marks.Append(prevLen == n && buf[i] != prev[i] ? "^^ " : "   ");
+                    }
+                    Console.WriteLine($"[{ms,8:F2} ms]  {hex.ToString().TrimEnd()}");
+                    if (prevLen == n && marks.ToString().Contains('^'))
+                        Console.WriteLine($"             {marks.ToString().TrimEnd()}");
+
+                    Array.Copy(buf, prev, n);
+                    prevLen = n;
+                }
+                tPrev = t;
+                havePrev = true;
+            }
+        }
+        return 0;
+    }
+
+    // ------------------------------------------------------------------ //
+    //  Helpers
+    // ------------------------------------------------------------------ //
+
+    private static bool TryOpen(HidDevice device, out HidStream stream)
+    {
+        if (device.TryOpen(out stream!)) return true;
+        Console.Error.WriteLine("Could not open the device for reading.");
+        Console.Error.WriteLine("Close anything that might hold it exclusively (Steam, DS4Windows,");
+        Console.Error.WriteLine("vendor software) and/or retry from an elevated prompt.");
+        return false;
+    }
+
+    private static int SafeMaxInputLength(HidDevice device)
+    {
+        try { return Math.Max(8, device.GetMaxInputReportLength()); }
+        catch { return 64; }
+    }
+
+    private static string Hex(byte[] buf, int n, int max)
+    {
+        int shown = Math.Min(n, max);
+        string s = string.Join(" ", buf.Take(shown).Select(b => $"{b:X2}"));
+        return shown < n ? s + " ..." : s;
+    }
+
+    private static double Percentile(List<double> values, double p)
+    {
+        var sorted = values.OrderBy(v => v).ToList();
+        int i = (int)Math.Round((p / 100.0) * (sorted.Count - 1));
+        return sorted[Math.Clamp(i, 0, sorted.Count - 1)];
+    }
+
+    private static void PrintStats(string what, List<double> deltas, int timeouts, int gaps)
+    {
+        Console.WriteLine();
+        Console.WriteLine($"--- {what}: {deltas.Count} intervals ---");
+        if (gaps > 0) Console.WriteLine($"({gaps} pauses > 100 ms excluded; {timeouts} read timeouts)");
+        else if (timeouts > 0) Console.WriteLine($"({timeouts} read timeouts)");
+        if (deltas.Count == 0) return;
+
+        double min = deltas.Min(), max = deltas.Max(), avg = deltas.Average();
+        double med = Percentile(deltas, 50), p99 = Percentile(deltas, 99);
+
+        Console.WriteLine($"interval ms: min={min:F3}  median={med:F3}  avg={avg:F3}  p99={p99:F3}  max={max:F3}");
+        Console.WriteLine($"=> ~{1000.0 / med:F0} Hz at the median ({1000.0 / avg:F0} Hz at the mean)");
+        Console.WriteLine();
+
+        // Buckets centered on the common USB polling intervals, with
+        // geometric boundaries (x0.707 .. x1.414 around each center).
+        (double center, string label)[] buckets =
+        {
+            (0.125, "0.125 ms (~8000 Hz)"),
+            (0.25,  "0.25 ms  (~4000 Hz)"),
+            (0.5,   "0.5 ms   (~2000 Hz)"),
+            (1,     "1 ms     (~1000 Hz)"),
+            (2,     "2 ms      (~500 Hz)"),
+            (4,     "4 ms      (~250 Hz)"),
+            (8,     "8 ms      (~125 Hz)"),
+            (16,    "16 ms    (~62.5 Hz)"),
+        };
+        var counts = new int[buckets.Length + 1];
+        foreach (double d in deltas)
+        {
+            int b = buckets.Length; // overflow bucket
+            for (int i = 0; i < buckets.Length; i++)
+            {
+                if (d < buckets[i].center * 1.4142)
+                {
+                    b = i;
+                    break;
+                }
+            }
+            counts[b]++;
+        }
+        int biggest = counts.Max();
+        for (int i = 0; i <= buckets.Length; i++)
+        {
+            if (counts[i] == 0) continue;
+            string label = i < buckets.Length ? buckets[i].label : "> 22.6 ms (slower)  ";
+            int barLen = biggest > 0 ? (int)Math.Round(40.0 * counts[i] / biggest) : 0;
+            double pct = 100.0 * counts[i] / deltas.Count;
+            Console.WriteLine($"  {label,-22} {new string('#', barLen),-40} {counts[i],6} ({pct:F1}%)");
+        }
+    }
+}
