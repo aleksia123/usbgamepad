@@ -25,6 +25,12 @@ adapter that remains is ~40 trivial lines.
   call — the achieved-rate readout for the Logs panel.
 * `LayoutDescription` reports the declared per-axis logical ranges and bit
   depths — this answers "is it actually 16-bit under the XInput skin?".
+  An axis shown as `X[raw 16bit]` means Windows' preparsed-caps
+  reconstruction returned a degenerate `0..0` logical range (its descriptor
+  said `0..0xFFFF`, which reads as `0..-1` under HID's signed items), so the
+  reader normalizes from the field's bit width instead — the same fallback
+  SDL uses. Confirmed on this pad: all five axes come back degenerate and
+  16-bit-raw except the hat.
 
 It compiles as part of `../hid-rate-probe` (kept warning-free there) and
 powers that tool's `--decode` mode.
@@ -41,7 +47,10 @@ report rate. Check before wiring anything into ReflexX:
 
 * sticks reach full range in all four directions (and note the layout
   line's bit depths);
-* **LT and RT move independently** — see the combined-trigger caveat below;
+* triggers: **confirmed combined on this pad** — the layout declares a lone
+  `Z` and no `Rz`/Brake/Accelerator, so expect `LT` to idle near mid-scale
+  (~32768) with the two physical triggers pushing it opposite ways, and
+  `RT` staying 0; see the caveat below;
 * each button lights exactly one bit (note which — you need the numbering
   for the adapter map);
 * dpad hits all 8 directions;
@@ -113,13 +122,14 @@ read loop.
 
 ## Caveats to design for
 
-* **Combined triggers.** If the IG_00 descriptor declares only `Z` (no
-  `Rz` and no Simulation `Brake`/`Accelerator`), the triggers share one
-  axis — the classic DirectInput view of XInput pads — and both-held is
-  indistinguishable. `--decode`'s layout line reveals this in seconds. If
-  so, a clean hybrid works: raw HID for sticks/buttons/dpad at native rate,
-  `XInputGetState` (125 Hz is plenty for triggers) for the two trigger
-  bytes.
+* **Combined triggers — CONFIRMED on this pad.** The IG_00 collection
+  declares `X Y Rx Ry Z Hat + 10 buttons`, no `Rz` and no Simulation
+  `Brake`/`Accelerator`: the triggers share the one `Z` axis (the classic
+  DirectInput view of XInput pads) and both-held is indistinguishable.
+  The reader exposes this as `HasSeparateTriggers == false` so the adapter
+  can branch on it. Recommended hybrid: raw HID for sticks/buttons/dpad at
+  native rate, `XInputGetState` (125 Hz is plenty for triggers) for the two
+  separate trigger bytes.
 * **Guide button** may not be present on the IG_00 collection at all.
 * The reader intentionally does **no** orientation or deadzone processing —
   it hands over exactly what the pad declares; all shaping stays in

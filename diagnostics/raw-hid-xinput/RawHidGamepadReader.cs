@@ -111,6 +111,14 @@ public sealed class RawHidGamepadReader : IDisposable
     /// <summary>Human-readable summary of the declared layout (axes, bit depths, buttons); null until first connect.</summary>
     public string? LayoutDescription => _layout;
 
+    /// <summary>
+    /// False when the collection declares no Rz/Brake/Accelerator, i.e. both
+    /// triggers share the single Z axis (LeftTrigger idles mid-scale and
+    /// both-held is ambiguous). Adapters should then source trigger values
+    /// elsewhere (e.g. XInputGetState) - see README. Valid after connect.
+    /// </summary>
+    public bool HasSeparateTriggers { get; private set; }
+
     public RawGamepadState LastState
     {
         get { lock (_stateLock) return _lastState; }
@@ -344,19 +352,34 @@ public sealed class RawHidGamepadReader : IDisposable
         return s;
     }
 
-    private static short NormalizeSigned(int v, DataItem di)
+    // The Windows HID stack reconstructs descriptors from preparsed caps and
+    // hands back a DEGENERATE logical range (0..0) for axes whose original
+    // descriptor said e.g. 0..0xFFFF: Logical Maximum is a signed item, so
+    // 0xFFFF reads as -1 and HIDP normalizes the "invalid" range away. Seen
+    // on the pad's IG_00 collection (all axes reported [0..0]). When that
+    // happens, fall back to the field's declared bit width, unsigned - the
+    // same fallback SDL's HID drivers use.
+    private static (long Min, long Range, bool FromBits) EffectiveRange(DataItem di)
     {
         long range = (long)di.LogicalMaximum - di.LogicalMinimum;
-        if (range <= 0) return 0;
-        long scaled = (v - (long)di.LogicalMinimum) * 65535 / range - 32768;
+        if (range > 0) return (di.LogicalMinimum, range, false);
+        int bits = Math.Clamp(di.ElementBits, 1, 31);
+        return (0, (1L << bits) - 1, true);
+    }
+
+    private static short NormalizeSigned(int v, DataItem di)
+    {
+        var (min, range, fromBits) = EffectiveRange(di);
+        long uv = fromBits ? (v & range) : (v - min); // mask kills stray sign-extension
+        long scaled = uv * 65535 / range - 32768;
         return (short)Math.Clamp(scaled, short.MinValue, short.MaxValue);
     }
 
     private static ushort NormalizeUnsigned(int v, DataItem di)
     {
-        long range = (long)di.LogicalMaximum - di.LogicalMinimum;
-        if (range <= 0) return 0;
-        long scaled = (v - (long)di.LogicalMinimum) * 65535 / range;
+        var (min, range, fromBits) = EffectiveRange(di);
+        long uv = fromBits ? (v & range) : (v - min);
+        long scaled = uv * 65535 / range;
         return (ushort)Math.Clamp(scaled, ushort.MinValue, ushort.MaxValue);
     }
 
@@ -375,10 +398,11 @@ public sealed class RawHidGamepadReader : IDisposable
         return s_hat8[idx & 7];
     }
 
-    private static string DescribeLayout(DeviceItem deviceItem)
+    private string DescribeLayout(DeviceItem deviceItem)
     {
         var parts = new List<string>();
         int buttons = 0;
+        bool separateTriggers = false;
         foreach (Report report in deviceItem.Reports.Where(r => r.ReportType == ReportType.Input))
         {
             foreach (DataItem di in report.DataItems)
@@ -387,9 +411,11 @@ public sealed class RawHidGamepadReader : IDisposable
                 {
                     uint page = usage >> 16, id = usage & 0xFFFF;
                     if (page == 0x0009) { buttons++; continue; }
+                    if ((page, id) is (0x0001, 0x35) or (0x0002, 0xC4) or (0x0002, 0xC5))
+                        separateTriggers = true; // Rz / Accelerator / Brake present
 
-                    long range = (long)di.LogicalMaximum - di.LogicalMinimum;
-                    int bits = range > 0 ? (int)Math.Ceiling(Math.Log2(range + 1)) : 0;
+                    var (_, range, fromBits) = EffectiveRange(di);
+                    int bits = (int)Math.Ceiling(Math.Log2(range + 1d));
                     string name = (page, id) switch
                     {
                         (0x0001, 0x30) => "X",
@@ -403,11 +429,14 @@ public sealed class RawHidGamepadReader : IDisposable
                         (0x0002, 0xC5) => "Brake",
                         _ => $"0x{page:X2}:{id:X2}",
                     };
-                    parts.Add($"{name}[{di.LogicalMinimum}..{di.LogicalMaximum}]={bits}bit");
+                    parts.Add(fromBits
+                        ? $"{name}[raw {bits}bit]" // declared range was degenerate; using bit width
+                        : $"{name}[{di.LogicalMinimum}..{di.LogicalMaximum}]={bits}bit");
                 }
             }
         }
         if (buttons > 0) parts.Add($"{buttons} buttons");
+        HasSeparateTriggers = separateTriggers;
         return string.Join("  ", parts);
     }
 
