@@ -5,10 +5,13 @@ Step 1's probe settled the question: `IG_00` delivers reports fast, and the
 this is **Step 2**: read the node raw.
 
 The ReflexX sources aren't available in this session (no such repo on the
-GitHub account this session can see), so the provider core is staged here as
-a **self-contained drop-in file** — HidSharp only, zero ReflexX types — plus
-a live validation harness. Everything hard lives in the core; the ReflexX
-adapter that remains is ~40 trivial lines.
+GitHub account this session can see), so the work is staged here as
+drop-in files plus a live validation harness:
+
+* `RawHidXInputProvider.cs` — the **finished ReflexX provider** (see below).
+* `RawHidGamepadReader.cs` — the same decode as a standalone, ReflexX-free
+  class; it powers the probe's `--decode` harness and remains useful for
+  any other consumer.
 
 ## What's here
 
@@ -63,50 +66,43 @@ anything into ReflexX:
 
 ## Dropping into ReflexX (Step 2)
 
-1. Copy `RawHidGamepadReader.cs` to `ReflexX.Infrastructure/Input/`
-   (rename the `RawHidXInput` namespace to taste). HidSharp is already a
-   dependency there (`Rp2350AppTransport.cs`).
-2. Add the thin adapter. Sketch — **placeholder member names**, align with
-   the real `IInputProvider`/`GamepadState` shapes:
+`RawHidXInputProvider.cs` is the finished provider: written against the
+`IInputProvider`/`GamepadState`/`InputDevice`/`GamepadButton` shapes visible
+in `XinputAppTransport`, in the same lifecycle idiom (`TryOpenStream`, read
+loop, `TearDownAfterReadFailure`, capped-backoff `TryReconnect`) — but
+**input-only**: IG_00 accepts no app output reports, so there is no
+`IOutputController` half; processed state keeps flowing out through the
+existing transport. Copy the one file into `ReflexX.Infrastructure/Input/`
+(it does not need `RawHidGamepadReader.cs`).
 
-```csharp
-public sealed class RawHidXInputProvider : IInputProvider, IDisposable
-{
-    private readonly RawHidGamepadReader _reader = new(0x3537, 0x10C5, "ig_00");
+It compiles clean against stub types mirroring those shapes; the expected
+in-tree fixes are cosmetic and all marked `TODO(map)`:
 
-    public event Action<GamepadState>? StateUpdated; // match the real signature
+1. `GamepadButton` member names in `ButtonMap` and `s_hat8` (A/B/X/Y,
+   shoulders, thumbs, Back/Start, dpad) — rename to the real enum members.
+2. `ButtonMap` **order** — one `--decode` run: press A, B, X, Y, LB, RB,
+   View, Menu, L3, R3 in that order; the DECODE SUMMARY's press-order list
+   should read `1..10`. If not, reorder the array to match.
+3. `CombinedZLeftIsHigh` — flip if LT/RT come out swapped in testing.
+4. Any `IInputProvider` members missing here → stub them like
+   `ExcludeXInputSlots`; delete any that belong to `IOutputController`.
 
-    public void Start()
-    {
-        _reader.Status += msg => Log.Info($"[RawHid] {msg}");        // -> Logs panel
-        _reader.StateUpdated += raw => StateUpdated?.Invoke(Map(raw));
-        _reader.Start();                                             // own thread, reconnects itself
-    }
+Why the `XinputAppTransport` template can't just take the pad's VID/PID:
+IG_00 is input-only (an `output >= ReportSize` device filter rejects it or
+picks a vendor collection instead), its reports carry no `0x11` report ID
+(that guard drops every report), and its layout is not the fixed 12-byte
+app payload — it is whatever the descriptor declares, hence the
+parser-driven decode.
 
-    private static GamepadState Map(in RawGamepadState raw) => new()
-    {
-        LeftX  = raw.LeftX,
-        LeftY  = Invert(raw.LeftY),   // HID Y is down-positive; XInput is up-positive
-        RightX = raw.RightX,
-        RightY = Invert(raw.RightY),
-        LeftTrigger  = raw.LeftTrigger,   // 0..65535; rescale if GamepadState wants bytes
-        RightTrigger = raw.RightTrigger,
-        // Button numbering: CONFIRM ONCE with --decode. Typical XInput-style order:
-        // 1=A 2=B 3=X 4=Y 5=LB 6=RB 7=Back 8=Start 9=LS 10=RS 11=Guide
-        A = raw.GetButton(1), B = raw.GetButton(2),
-        X = raw.GetButton(3), Y = raw.GetButton(4),
-        // ... dpad from raw.Dpad flags ...
-    };
-
-    private static short Invert(short v) => v == short.MinValue ? short.MaxValue : (short)-v;
-
-    public void Dispose() => _reader.Dispose();
-}
-```
-
-`StateUpdated` fires on the reader thread at up to native rate — apply the
-same marshalling/queueing ReflexX already uses for `Rp2350AppTransport`'s
+`StateUpdated` fires on the read-loop thread at up to native rate — apply
+the same marshalling/queueing ReflexX already uses for the app transport's
 read loop.
+
+Aside: if a `0x10`/`0x11` app channel to the **Pico in XInput mode** is ever
+wanted (an `XinputAppTransport` in the literal sense), that requires
+firmware work in this repo first — XInput mode currently enumerates a single
+interface with no spare (see `src/boot_mode.h`), so a second vendor-HID
+interface would have to be added alongside it.
 
 ## Step 3 wiring
 
@@ -121,9 +117,11 @@ read loop.
 * **Registration:** `WebShellServices.cs`, gated behind a Settings toggle
   (e.g. "High-polling mode"), default **off** — device-specific behavior
   shouldn't silently change generic pads.
-* **Achieved-rate readout:** poll `GetRateStats()` about once a second and
-  surface it in the Logs panel / debug stat, so the real-world number on the
-  actual cable/hub stays visible.
+* **Achieved-rate readout:** the provider's `LogDiagnostics(label)` logs
+  reports/min/avg/max ms since its previous call — invoke it ~1/s (or on the
+  existing diagnostics cadence) so the real-world number on the actual
+  cable/hub stays visible in the Logs panel. (`RawHidGamepadReader` exposes
+  the same via `GetRateStats()`.)
 
 ## Caveats to design for
 
