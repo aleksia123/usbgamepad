@@ -93,11 +93,32 @@ public sealed class RawHidGamepadReader : IDisposable
     private double _sum, _min = double.MaxValue, _max, _lastMs;
     private long _total;
 
+    // Report layout of the target pad's IG_00 collection, verified ON THE
+    // WIRE with the probe's --map mode (every rail/press observed directly).
+    // Used instead of the descriptor-driven parser for this VID/PID, because
+    // Windows' reconstructed descriptor misplaces the field offsets:
+    //   b00      report id (0x00)
+    //   b01-b02  LX  u16 LE   0 = left, 65535 = right
+    //   b03-b04  LY  u16 LE   0 = up,   65535 = down (HID orientation)
+    //   b05-b06  RX  u16 LE   0 = left, 65535 = right
+    //   b07-b08  RY  u16 LE   0 = up,   65535 = down
+    //   b09-b10  combined trigger u16 LE: 32768 rest, ->65535 LT, ->0 RT
+    //   b11      buttons 1-8 (A B X Y LB RB Back Start = bits 0-7)
+    //   b12      bits 0-1 = buttons 9-10 (L3 R3); bits 2-5 = hat 0=idle 1=N..8=NW
+    //   b13-b14  unused
+    private const int VerifiedVendorId = 0x3537;
+    private const int VerifiedProductId = 0x10C5;
+    private const string VerifiedLayoutText =
+        "verified fixed layout: LX@1 LY@3 RX@5 RY@7 u16; combined trigger u16@9 (LT=high, split into LT/RT); buttons@11; hat@12 bits2-5";
+
+    private readonly bool _useVerifiedLayout;
+
     public RawHidGamepadReader(int vendorId = 0x3537, int productId = 0x10C5, string devicePathFilter = "ig_00")
     {
         _vendorId = vendorId;
         _productId = productId;
         _pathFilter = devicePathFilter;
+        _useVerifiedLayout = vendorId == VerifiedVendorId && productId == VerifiedProductId;
     }
 
     /// <summary>Fires on the reader thread for every input report. Keep handlers fast.</summary>
@@ -230,7 +251,8 @@ public sealed class RawHidGamepadReader : IDisposable
             return;
         }
 
-        _layout = DescribeLayout(deviceItem);
+        string described = DescribeLayout(deviceItem); // also sets HasSeparateTriggers
+        _layout = _useVerifiedLayout ? VerifiedLayoutText : described;
 
         if (!device.TryOpen(out HidStream? stream))
         {
@@ -259,10 +281,14 @@ public sealed class RawHidGamepadReader : IDisposable
 
                 while (receiver.TryRead(buf, 0, out Report? report))
                 {
-                    if (!parser.TryParseReport(buf, 0, report)) continue;
-
                     long t = Stopwatch.GetTimestamp();
-                    RawGamepadState state = BuildState(parser, t);
+                    RawGamepadState state;
+                    if (_useVerifiedLayout && buf.Length >= 13 && buf[0] == 0x00)
+                        state = DecodeVerified(buf, t);
+                    else if (parser.TryParseReport(buf, 0, report))
+                        state = BuildState(parser, t);
+                    else
+                        continue;
 
                     if (havePrev)
                     {
@@ -305,6 +331,31 @@ public sealed class RawHidGamepadReader : IDisposable
             if (score > bestScore) { best = item; bestScore = score; }
         }
         return best;
+    }
+
+    /// <summary>Decode via the wire-verified fixed layout (see the table at the
+    /// top). The combined trigger is split around mid-scale: LT is the high
+    /// side (verified), so both triggers idle at 0; both-held cancels toward
+    /// zero, which is inherent to this collection.</summary>
+    private static RawGamepadState DecodeVerified(byte[] b, long timestamp)
+    {
+        static ushort U16(byte[] r, int o) => (ushort)(r[o] | (r[o + 1] << 8));
+
+        int delta = U16(b, 9) - 32768;
+        var s = new RawGamepadState
+        {
+            TimestampTicks = timestamp,
+            LeftX = (short)(U16(b, 1) - 32768),
+            LeftY = (short)(U16(b, 3) - 32768), // HID orientation kept: 0 = up
+            RightX = (short)(U16(b, 5) - 32768),
+            RightY = (short)(U16(b, 7) - 32768),
+            LeftTrigger = (ushort)(Math.Clamp(delta, 0, 32767) * 65535L / 32767),
+            RightTrigger = (ushort)(Math.Clamp(-delta, 0, 32768) * 65535L / 32768),
+            Buttons = (uint)(b[11] | ((b[12] & 0x03) << 8)),
+        };
+        int hat = (b[12] >> 2) & 0x0F;
+        if (hat is >= 1 and <= 8) s.Dpad = s_hat8[hat - 1];
+        return s;
     }
 
     private static RawGamepadState BuildState(DeviceItemInputParser parser, long timestamp)

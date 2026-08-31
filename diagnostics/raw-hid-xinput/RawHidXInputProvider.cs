@@ -25,13 +25,18 @@
 // 0xFFFF quirk). Decode therefore runs through HidSharp's report parser,
 // driven by declared usages and ranges with a bit-width fallback.
 //
+// Decode uses the report layout verified ON THE WIRE with the probe's
+// --map mode (see the table at DecodeVerified): every stick rail, both
+// triggers, hat values and button A were observed directly, and the earlier
+// DECODE SUMMARY confirmed the button press order 1..10 = A B X Y LB RB
+// Back Start L3 R3. LT was verified as the HIGH side of the combined
+// trigger. The descriptor-driven parser remains as fallback for reports
+// that don't match the verified shape.
+//
 // Compiled against stub types mirroring the shapes visible in
 // XinputAppTransport - expect at most cosmetic fixes in-tree:
-//   * TODO(map): GamepadButton member names in ButtonMap/hat mapping below.
-//   * TODO(map): ButtonMap ORDER - confirm with the probe's DECODE SUMMARY
-//     (press A,B,X,Y,LB,RB,View,Menu,L3,R3 in order; "press order" should
-//     read 1..10, else reorder the array to match).
-//   * TODO(map): CombinedZLeftIsHigh - flip if LT/RT come out swapped.
+//   * TODO: GamepadButton member NAMES in ButtonMap/s_hat8 (order is
+//     confirmed; only rename members to the real enum).
 //   * If IInputProvider has members not implemented here, stub them like
 //     ExcludeXInputSlots below; delete any that belong to IOutputController.
 
@@ -254,12 +259,19 @@ public sealed class RawHidXInputProvider : IInputProvider, IDisposable
                 var read = stream.Read(buffer, 0, buffer.Length);
                 if (read <= 0) continue;
 
-                var report = MatchReport(buffer);
-                if (report is null || !parser.TryParseReport(buffer, 0, report)) continue;
+                GamepadState state;
+                if (UseVerifiedFixedLayout && read >= 13 && buffer[0] == 0x00)
+                {
+                    state = DecodeVerified(buffer);
+                }
+                else
+                {
+                    var report = MatchReport(buffer);
+                    if (report is null || !parser.TryParseReport(buffer, 0, report)) continue;
+                    state = DecodeCurrent(parser);
+                }
 
-                long now = Stopwatch.GetTimestamp();
-                RecordInterval(now);
-                var state = DecodeCurrent(parser);
+                RecordInterval(Stopwatch.GetTimestamp());
                 if (_device is not null) _device.LastSeen = DateTime.UtcNow;
                 StateUpdated?.Invoke(DeviceId, state);
             }
@@ -377,7 +389,54 @@ public sealed class RawHidXInputProvider : IInputProvider, IDisposable
     }
 
     // ------------------------------------------------------------------ //
-    //  Descriptor-driven decode -> GamepadState
+    //  Verified fixed-layout decode (primary path for this pad)
+    //
+    //  Report layout of the IG_00 collection, mapped on the wire with the
+    //  probe's --map mode (every rail/press observed directly):
+    //    b00      report id (0x00)
+    //    b01-b02  LX  u16 LE   0 = left, 65535 = right
+    //    b03-b04  LY  u16 LE   0 = up,   65535 = down (HID orientation)
+    //    b05-b06  RX  u16 LE   0 = left, 65535 = right
+    //    b07-b08  RY  u16 LE   0 = up,   65535 = down
+    //    b09-b10  combined trigger u16 LE: 32768 rest, ->65535 LT, ->0 RT
+    //    b11      buttons 1-8 (A B X Y LB RB Back Start = bits 0-7)
+    //    b12      bits 0-1 = buttons 9-10 (L3 R3); bits 2-5 = hat 0=idle 1=N..8=NW
+    //    b13-b14  unused
+    // ------------------------------------------------------------------ //
+
+    private const bool UseVerifiedFixedLayout = true;
+
+    private static GamepadState DecodeVerified(byte[] b)
+    {
+        static ushort U16(byte[] r, int o) => (ushort)(r[o] | (r[o + 1] << 8));
+
+        GamepadButton buttons = default;
+        int bits = b[11] | ((b[12] & 0x03) << 8);
+        for (int i = 0; i < ButtonMap.Length; i++)
+            if ((bits & (1 << i)) != 0) buttons |= ButtonMap[i];
+        int hat = (b[12] >> 2) & 0x0F;
+        if (hat is >= 1 and <= 8) buttons |= s_hat8[hat - 1];
+
+        // Combined trigger, LT = high side (verified). Both triggers idle at
+        // 0; both-held cancels toward zero - inherent to this collection.
+        int delta = U16(b, 9) - 32768;
+
+        return new GamepadState
+        {
+            Buttons = buttons,
+            LeftTrigger = new TriggerValue((byte)(Math.Clamp(delta, 0, 32767) * 255 / 32767)),
+            RightTrigger = new TriggerValue((byte)(Math.Clamp(-delta, 0, 32768) * 255 / 32768)),
+            LeftStick = new StickPosition((short)(U16(b, 1) - 32768), FlipY(U16(b, 3))),
+            RightStick = new StickPosition((short)(U16(b, 5) - 32768), FlipY(U16(b, 7))),
+            TimestampTicks = (long)MonotonicClock.NowMs
+        };
+    }
+
+    // HID: 0 = up. XInput: positive = up.
+    private static short FlipY(int raw) => (short)Math.Clamp(32768 - raw, short.MinValue, short.MaxValue);
+
+    // ------------------------------------------------------------------ //
+    //  Descriptor-driven decode -> GamepadState (fallback path)
     // ------------------------------------------------------------------ //
 
     // TODO(map): HID button usage N (1-based) -> GamepadButton flag, in usage

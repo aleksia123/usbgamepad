@@ -58,10 +58,10 @@ anything into ReflexX:
 
 * sticks reach full range in all four directions (and note the layout
   line's bit depths);
-* triggers: **confirmed combined on this pad** — the layout declares a lone
-  `Z` and no `Rz`/Brake/Accelerator, so expect `LT` to idle near mid-scale
-  (~32768) with the two physical triggers pushing it opposite ways, and
-  `RT` staying 0; see the caveat below;
+* triggers: combined at the source, but split by the reader — LT and RT
+  each idle at 0 and rise toward 65535 when pulled; holding **both**
+  partially cancels them toward 0 (inherent to this collection — see the
+  caveat below);
 * each button lights exactly one bit (note which — you need the numbering
   for the adapter map);
 * dpad hits all 8 directions;
@@ -126,28 +126,41 @@ interface would have to be added alongside it.
   cable/hub stays visible in the Logs panel. (`RawHidGamepadReader` exposes
   the same via `GetRateStats()`.)
 
-## Known issue: reconstructed field offsets can be wrong
+## The verified report layout (resolved)
 
-A real `--decode` run on this pad showed buttons and rate perfect but tiny
-stick ranges, a Z frozen through full trigger pulls, and a silent hat: the
-descriptor Windows lets HidSharp reconstruct doesn't carry the true
-in-report bit positions, so values can be extracted from the wrong offsets
-(same root cause family as the degenerate ranges). The remedy is the
-probe's `--map` mode: one guided run (hold one control per prompt) prints a
-`MAP SUMMARY` of the actual byte offsets per control, from which a
-verified fixed-offset decode gets wired into the reader and provider (the
-descriptor-driven path stays as the fallback for other devices).
+The descriptor Windows lets HidSharp reconstruct doesn't carry the true
+in-report bit positions, so the parser-driven decode read values from wrong
+offsets (tiny stick ranges, frozen Z, silent hat). A `--map` run measured
+the real layout on the wire — every stick rail, both triggers, hat values
+and button A observed directly:
+
+| Bytes | Field |
+|---|---|
+| b00 | report id `0x00` |
+| b01–02 | LX, u16 LE — 0 left, 65535 right |
+| b03–04 | LY, u16 LE — 0 up, 65535 down (HID orientation) |
+| b05–06 | RX, u16 LE — 0 left, 65535 right |
+| b07–08 | RY, u16 LE — 0 up, 65535 down |
+| b09–10 | combined trigger, u16 LE — 32768 rest, →65535 LT, →0 RT |
+| b11 | buttons 1–8: A B X Y LB RB Back Start (bits 0–7) |
+| b12 | bits 0–1: buttons 9–10 (L3 R3); bits 2–5: hat value 0=idle, 1=N … 8=NW |
+| b13–14 | unused |
+
+Both the reader and the provider now decode these fixed offsets as their
+primary path for `3537:10C5` (the descriptor-driven parse stays as the
+fallback for any other device), and both split the combined trigger around
+mid-scale — LT is the high side, verified — so LT and RT each idle at 0.
 
 ## Caveats to design for
 
-* **Combined triggers — CONFIRMED on this pad.** The IG_00 collection
-  declares `X Y Rx Ry Z Hat + 10 buttons`, no `Rz` and no Simulation
-  `Brake`/`Accelerator`: the triggers share the one `Z` axis (the classic
-  DirectInput view of XInput pads) and both-held is indistinguishable.
-  The reader exposes this as `HasSeparateTriggers == false` so the adapter
-  can branch on it. Recommended hybrid: raw HID for sticks/buttons/dpad at
-  native rate, `XInputGetState` (125 Hz is plenty for triggers) for the two
-  separate trigger bytes.
+* **Combined triggers — confirmed, and split.** The collection carries one
+  combined trigger axis (b09–10: rest mid-scale, LT verified as the high
+  side). Reader and provider split it, so LT/RT behave normally for
+  single-trigger use — but holding **both** cancels them toward zero;
+  that ambiguity is physical to this collection (`HasSeparateTriggers ==
+  false` on the reader). If both-held matters for the use case, the hybrid
+  stands: raw HID for sticks/buttons/dpad at native rate, `XInputGetState`
+  (125 Hz is plenty for triggers) for the two separate trigger bytes.
 * **Guide button** may not be present on the IG_00 collection at all.
 * The reader intentionally does **no** orientation or deadzone processing —
   it hands over exactly what the pad declares; all shaping stays in
