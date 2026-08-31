@@ -42,8 +42,13 @@ cd ..\hid-rate-probe
 dotnet run -- --decode
 ```
 
-Live line shows all axes, triggers, button bits, dpad, and the rolling
-report rate. Check before wiring anything into ReflexX:
+The tool prints a guided capture sequence (stick sweeps, buttons in a fixed
+order, dpad, triggers); do it, press Ctrl+C, and it emits a paste-ready
+`DECODE SUMMARY` block — observed per-axis ranges, button press order,
+dpad coverage, and rate. That block is everything needed to finalize the
+adapter's button map. Meanwhile the live line shows all axes, triggers,
+button bits, dpad, and the rolling report rate. Check before wiring
+anything into ReflexX:
 
 * sticks reach full range in all four directions (and note the layout
   line's bit depths);

@@ -44,6 +44,8 @@ dotnet run -- --xinput
 dotnet run -- --dump --filter col04
 
 # 5. (After a FAST verdict) validate the plan-Step-2 reader core live:
+#    follow its on-screen capture sequence, then Ctrl+C - it prints a
+#    paste-ready DECODE SUMMARY block at the end.
 dotnet run -- --decode
 ```
 

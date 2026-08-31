@@ -142,7 +142,8 @@ internal static class Program
             Modes (default: rate probe of the raw HID node):
               --list           list matching HID nodes and exit
               --dump           hex-dump reports, marking bytes that changed (mapping harness)
-              --decode         live-decode via the descriptor-driven reader (Step 2 validation)
+              --decode         live-decode via the descriptor-driven reader; prints a
+                               paste-ready DECODE SUMMARY on exit (Step 2 validation)
               --xinput [n]     probe via XInputGetState(n) instead of raw HID (default pad 0)
 
             Selection (raw HID modes):
@@ -476,17 +477,91 @@ internal static class Program
     //  Decode mode - live view through the Step-2 RawHidGamepadReader
     // ------------------------------------------------------------------ //
 
+    private sealed class Observed
+    {
+        public bool HaveFirst;
+        public RawGamepadState First;
+        public int MinLX = int.MaxValue, MaxLX = int.MinValue;
+        public int MinLY = int.MaxValue, MaxLY = int.MinValue;
+        public int MinRX = int.MaxValue, MaxRX = int.MinValue;
+        public int MinRY = int.MaxValue, MaxRY = int.MinValue;
+        public int MinLT = int.MaxValue, MaxLT = int.MinValue;
+        public int MinRT = int.MaxValue, MaxRT = int.MinValue;
+        public uint ButtonsSeen;
+        public readonly List<int> PressOrder = new();
+        public readonly HashSet<RawDpad> DpadSeen = new();
+        public long PrevTicks;
+        public long Count;
+        public double SumMs, MinMs = double.MaxValue, MaxMs;
+    }
+
+    private static string DpadName(RawDpad d) => d switch
+    {
+        RawDpad.None => "none",
+        RawDpad.Up => "U",
+        RawDpad.Up | RawDpad.Right => "UR",
+        RawDpad.Right => "R",
+        RawDpad.Down | RawDpad.Right => "DR",
+        RawDpad.Down => "D",
+        RawDpad.Down | RawDpad.Left => "DL",
+        RawDpad.Left => "L",
+        RawDpad.Up | RawDpad.Left => "UL",
+        _ => d.ToString(),
+    };
+
     private static int DecodeLive(int vid, int pid, string filter, double seconds)
     {
         Console.WriteLine($"Live decode of VID=0x{vid:X4} PID=0x{pid:X4} filter=\"{filter}\"");
-        Console.WriteLine("via RawHidGamepadReader (descriptor-driven). Ctrl+C to stop.");
-        Console.WriteLine("Check that every control maps sensibly and full range is reached.");
+        Console.WriteLine("""
+            via RawHidGamepadReader (descriptor-driven). For a complete summary, do
+            this sequence, then press Ctrl+C:
+              1. slow full circle on EACH stick, then push each to all 4 rails
+              2. press each button ONCE, in a fixed order you note down, e.g.
+                 A, B, X, Y, LB, RB, Back/View, Start/Menu, L3, R3 (pause between)
+              3. dpad: all 8 directions
+              4. pull LT fully, release; pull RT fully, release
+            A paste-ready DECODE SUMMARY block is printed at the end.
+            """);
         Console.WriteLine();
 
+        var obs = new Observed();
         using var reader = new RawHidGamepadReader(vid, pid, filter);
         reader.Status += msg => Console.WriteLine($"\n[reader] {msg}");
+        reader.StateUpdated += st =>
+        {
+            lock (obs)
+            {
+                if (!obs.HaveFirst) { obs.First = st; obs.HaveFirst = true; }
+                obs.MinLX = Math.Min(obs.MinLX, st.LeftX); obs.MaxLX = Math.Max(obs.MaxLX, st.LeftX);
+                obs.MinLY = Math.Min(obs.MinLY, st.LeftY); obs.MaxLY = Math.Max(obs.MaxLY, st.LeftY);
+                obs.MinRX = Math.Min(obs.MinRX, st.RightX); obs.MaxRX = Math.Max(obs.MaxRX, st.RightX);
+                obs.MinRY = Math.Min(obs.MinRY, st.RightY); obs.MaxRY = Math.Max(obs.MaxRY, st.RightY);
+                obs.MinLT = Math.Min(obs.MinLT, st.LeftTrigger); obs.MaxLT = Math.Max(obs.MaxLT, st.LeftTrigger);
+                obs.MinRT = Math.Min(obs.MinRT, st.RightTrigger); obs.MaxRT = Math.Max(obs.MaxRT, st.RightTrigger);
+
+                uint newBits = st.Buttons & ~obs.ButtonsSeen;
+                for (int bit = 0; bit < 32; bit++)
+                    if ((newBits & (1u << bit)) != 0) obs.PressOrder.Add(bit + 1);
+                obs.ButtonsSeen |= st.Buttons;
+                if (st.Dpad != RawDpad.None) obs.DpadSeen.Add(st.Dpad);
+
+                if (obs.PrevTicks != 0)
+                {
+                    double ms = (st.TimestampTicks - obs.PrevTicks) * 1000.0 / Stopwatch.Frequency;
+                    if (ms <= 250)
+                    {
+                        obs.Count++;
+                        obs.SumMs += ms;
+                        if (ms < obs.MinMs) obs.MinMs = ms;
+                        if (ms > obs.MaxMs) obs.MaxMs = ms;
+                    }
+                }
+                obs.PrevTicks = st.TimestampTicks;
+            }
+        };
         reader.Start();
 
+        bool live = !Console.IsOutputRedirected; // piped/redirected: no \r line noise
         bool timed = seconds > 0;
         long freq = Stopwatch.Frequency;
         long tEnd = Stopwatch.GetTimestamp() + (long)(seconds * freq);
@@ -503,7 +578,7 @@ internal static class Program
                 rate = reader.GetRateStats();
                 lastStatsAt = now;
             }
-            if (!reader.IsConnected) continue;
+            if (!live || !reader.IsConnected) continue;
 
             var st = reader.LastState;
             string dpad =
@@ -518,12 +593,35 @@ internal static class Program
             Console.Write("\r" + line.PadRight(Math.Max(prevLen, line.Length)));
             prevLen = line.Length;
         }
-        Console.WriteLine();
+        if (live) Console.WriteLine();
+        reader.Stop();
 
-        var final = reader.GetRateStats();
         Console.WriteLine();
-        Console.WriteLine($"Layout: {reader.LayoutDescription ?? "(never connected)"}");
-        Console.WriteLine($"Total reports decoded: {final.TotalReports}");
+        Console.WriteLine("==== DECODE SUMMARY (paste this whole block back) ====");
+        Console.WriteLine($"layout   : {reader.LayoutDescription ?? "(never connected)"}");
+        Console.WriteLine($"triggers : {(reader.LayoutDescription == null ? "?" : reader.HasSeparateTriggers ? "separate" : "COMBINED on Z")}");
+        lock (obs)
+        {
+            if (!obs.HaveFirst)
+            {
+                Console.WriteLine("no reports received - was the pad connected and moving?");
+            }
+            else
+            {
+                Console.WriteLine($"LX range : {obs.MinLX} .. {obs.MaxLX}   (first seen {obs.First.LeftX})");
+                Console.WriteLine($"LY range : {obs.MinLY} .. {obs.MaxLY}   (first seen {obs.First.LeftY})");
+                Console.WriteLine($"RX range : {obs.MinRX} .. {obs.MaxRX}   (first seen {obs.First.RightX})");
+                Console.WriteLine($"RY range : {obs.MinRY} .. {obs.MaxRY}   (first seen {obs.First.RightY})");
+                Console.WriteLine($"LT range : {obs.MinLT} .. {obs.MaxLT}   (first seen {obs.First.LeftTrigger})");
+                Console.WriteLine($"RT range : {obs.MinRT} .. {obs.MaxRT}   (first seen {obs.First.RightTrigger})");
+                Console.WriteLine($"buttons  : mask 0x{obs.ButtonsSeen:X4}, press order: " +
+                    (obs.PressOrder.Count == 0 ? "(none pressed)" : string.Join(", ", obs.PressOrder)));
+                Console.WriteLine($"dpad     : {(obs.DpadSeen.Count == 0 ? "(none seen)" : string.Join(" ", obs.DpadSeen.Select(DpadName)))}");
+                double avg = obs.Count > 0 ? obs.SumMs / obs.Count : 0;
+                Console.WriteLine($"rate     : {obs.Count} intervals  min={obs.MinMs:F3}  avg={avg:F3}  max={obs.MaxMs:F3} ms");
+            }
+        }
+        Console.WriteLine("======================================================");
         return 0;
     }
 
