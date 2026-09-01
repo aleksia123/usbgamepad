@@ -1,4 +1,5 @@
 #include <pico/stdlib.h>
+#include "hardware/clocks.h" // set_sys_clock_khz(); not pulled in by pico/stdlib.h on SDK 2.1.1
 #include "hardware/gpio.h"
 #include "pico/multicore.h"
 
