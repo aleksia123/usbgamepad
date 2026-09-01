@@ -14,6 +14,14 @@
 // Class Driver Configuration
 //--------------------------------------------------------------------+
 
+// Frame interval the host polls the controller's IN endpoint at, overriding
+// the pad's declared bInterval when that is slower (see xinput_host.c). 1 =
+// every 1 ms frame = 1000 Hz, the fastest a full-speed bus allows. Raise it
+// if a particular controller misbehaves when polled faster than it asked.
+#ifndef XINPUT_HOST_IN_POLL_INTERVAL_MS
+#define XINPUT_HOST_IN_POLL_INTERVAL_MS 1
+#endif
+
 #ifndef CFG_TUH_XINPUT_EPIN_BUFSIZE
 #define CFG_TUH_XINPUT_EPIN_BUFSIZE 64
 #endif
