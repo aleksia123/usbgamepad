@@ -10,6 +10,13 @@
 
 #include "drivermanager.h"
 
+// This firmware adds a second USB interface alongside XInput (see
+// src/app_transport.h) and needs Microsoft OS descriptors for interface 0
+// (see src/xinput_ms_os_desc.h). Both headers live in the application's
+// src/, which the root CMakeLists puts on this target's include path.
+#include "app_transport.h"
+#include "xinput_ms_os_desc.h"
+
 static bool usb_mounted;
 static bool usb_suspended;
 
@@ -31,6 +38,9 @@ const usbd_class_driver_t *usbd_app_driver_get_cb(uint8_t *driver_count)
 
 uint16_t tud_hid_get_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t *buffer, uint16_t reqlen) 
 {
+	if (itf == APP_TRANSPORT_HID_INSTANCE)
+		return app_transport_on_get_report(report_id, report_type, buffer, reqlen);
+
 	return DriverManager::getInstance().getDriver()->get_report(report_id, report_type, buffer, reqlen);
 }
 
@@ -38,6 +48,16 @@ uint16_t tud_hid_get_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t
 // received data on OUT endpoint ( Report ID = 0, Type = 0 )
 void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t const *buffer, uint16_t bufsize) 
 {
+	if (itf == APP_TRANSPORT_HID_INSTANCE)
+	{
+		// Deliberately NOT echoed back. The application writes an output
+		// report on every change - up to once per 1 ms frame - and each echo
+		// would claim an IN slot that a physical_state report needs, roughly
+		// halving the rate this interface exists to provide.
+		app_transport_on_set_report(report_id, report_type, buffer, bufsize);
+		return;
+	}
+
 	DriverManager::getInstance().getDriver()->set_report(report_id, report_type, buffer, bufsize);
 	tud_hid_report(report_id, buffer, bufsize); // echo back anything we received from host
 }
@@ -72,6 +92,10 @@ void tud_resume_cb(void)
 // Vendor Controlled XFER occured
 bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const *request) 
 {
+	// The follow-up to string 0xEE: Windows fetches the Extended Compat ID
+	// descriptor with a vendor request. Claims only its own request code.
+	if (ms_os_desc_vendor_control_xfer_cb(rhport, stage, request)) return true;
+
 	return DriverManager::getInstance().getDriver()->vendor_control_xfer_cb(rhport, stage, request);
 }
 
@@ -80,6 +104,10 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
 // Application return pointer to descriptor, whose contents must exist long enough for transfer to complete
 uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid) 
 {
+	// Windows asks for string 0xEE once during enumeration to discover the
+	// MS OS descriptors that get xusb22.sys to bind interface 0.
+	if (index == 0xEE) return ms_os_string_descriptor();
+
 	return DriverManager::getInstance().getDriver()->get_descriptor_string_cb(index, langid);
 }
 
@@ -95,6 +123,8 @@ uint8_t const *tud_descriptor_device_cb()
 // Descriptor contents must exist long enough for transfer to complete
 uint8_t const *tud_hid_descriptor_report_cb(uint8_t itf) 
 {
+	if (itf == APP_TRANSPORT_HID_INSTANCE) return app_transport_report_descriptor();
+
 	return DriverManager::getInstance().getDriver()->get_hid_descriptor_report_cb(itf);
 }
 

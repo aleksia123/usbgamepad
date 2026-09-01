@@ -6,6 +6,7 @@
 #include "drivers/xinput/XInputDriver.h"
 #include "drivers/shared/driverhelper.h"
 #include "descriptors/XInputDescriptors.h"
+#include "usb_serial.h" // application-provided, see src/usb_serial.h
 
 #define XINPUT_OUT_SIZE 32
 
@@ -182,7 +183,17 @@ bool XInputDriver::vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_co
 
 const uint16_t * XInputDriver::get_descriptor_string_cb(uint8_t index, uint16_t langid) 
 {
-	const char *value = (const char *)xinput_string_descriptors[index];
+	// Bounds check first: Windows probes string indices we do not define,
+	// and the table lookup below would otherwise read past its end.
+	if (index >= (sizeof(xinput_string_descriptors) / sizeof(xinput_string_descriptors[0])))
+		return nullptr;
+
+	// Index 3 is iSerialNumber. Serve the per-board id rather than the
+	// compiled-in literal: Windows keys its composite/WCID cache off
+	// VID&PID&serial, so a constant serial makes a stale cached probe
+	// stick across reflashes. See src/usb_serial.h.
+	const char *value = (index == 3) ? usb_serial_string()
+	                                 : (const char *)xinput_string_descriptors[index];
 	return getStringDescriptor(value, index); // getStringDescriptor returns a static array
 }
 

@@ -78,12 +78,12 @@ static const uint8_t xinput_device_descriptor[] =
 	0x12,       // bLength
 	0x01,       // bDescriptorType (Device)
 	0x00, 0x02, // bcdUSB 2.00
-	0xFF,	      // bDeviceClass
-	0xFF,	      // bDeviceSubClass
-	0xFF,	      // bDeviceProtocol
+	0x00,	      // bDeviceClass    (composite: defined per interface)
+	0x00,	      // bDeviceSubClass
+	0x00,	      // bDeviceProtocol
 	0x40,	      // bMaxPacketSize0 64
-	0x5E, 0x04, // idVendor 0x045E
-	0x8E, 0x02, // idProduct 0x028E
+	0x09, 0x12, // idVendor 0x1209  (see xinput_ms_os_desc.h: a composite
+	0x01, 0x00, // idProduct 0x0001  device cannot keep Microsoft's ids)
 	0x14, 0x01, // bcdDevice 2.14
 	0x01,       // iManufacturer (String Index)
 	0x02,       // iProduct (String Index)
@@ -95,8 +95,8 @@ static const uint8_t xinput_configuration_descriptor[] =
 {
 	0x09,        // bLength
 	0x02,        // bDescriptorType (Configuration)
-	0x30, 0x00,  // wTotalLength 48
-	0x01,        // bNumInterfaces 1
+	0x50, 0x00,  // wTotalLength 80  (48 XInput + 32 app transport)
+	0x02,        // bNumInterfaces 2
 	0x01,        // bConfigurationValue
 	0x00,        // iConfiguration (String Index)
 	0x80,        // bmAttributes
@@ -138,6 +138,43 @@ static const uint8_t xinput_configuration_descriptor[] =
 	0x03,        // bmAttributes (Interrupt)
 	0x20, 0x00,  // wMaxPacketSize 32
 	0x08,        // bInterval 8 (unit depends on device speed)
+
+	// ---- Interface 1: app transport (see src/app_transport.h) ----
+	// A plain HID interface carrying the ~1000 Hz pipe to the PC
+	// application. Windows' built-in HID driver binds it with no help;
+	// only interface 0 needs the MS OS descriptors.
+	0x09,        // bLength
+	0x04,        // bDescriptorType (Interface)
+	0x01,        // bInterfaceNumber 1
+	0x00,        // bAlternateSetting
+	0x02,        // bNumEndpoints 2
+	0x03,        // bInterfaceClass (HID)
+	0x00,        // bInterfaceSubClass (none - not a boot device)
+	0x00,        // bInterfaceProtocol (none)
+	0x00,        // iInterface (String Index)
+
+	0x09,        // bLength
+	0x21,        // bDescriptorType (HID)
+	0x11, 0x01,  // bcdHID 1.11
+	0x00,        // bCountryCode
+	0x01,        // bNumDescriptors
+	0x22,        // bDescriptorType[0] (Report)
+	0x21, 0x00,  // wDescriptorLength[0] 33 - must match the
+	             // _Static_assert in src/app_transport.c
+
+	0x07,        // bLength
+	0x05,        // bDescriptorType (Endpoint)
+	0x82,        // bEndpointAddress (IN/D2H)
+	0x03,        // bmAttributes (Interrupt)
+	0x40, 0x00,  // wMaxPacketSize 64
+	0x01,        // bInterval 1 - the 1 ms slot this mode exists for
+
+	0x07,        // bLength
+	0x05,        // bDescriptorType (Endpoint)
+	0x02,        // bEndpointAddress (OUT/H2D)
+	0x03,        // bmAttributes (Interrupt)
+	0x40, 0x00,  // wMaxPacketSize 64
+	0x01,        // bInterval 1
 };
 
 #endif // _XINPUT_DESCRIPTORS_H_
