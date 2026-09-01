@@ -106,6 +106,25 @@ Move a stick continuously and read the **median** interval, not the average —
 HID only reports on change, so pauses inflate the mean without costing latency.
 Expect a median near 1.0 ms on `MI_01`.
 
+## The pad's own polling interval
+
+Once the app transport was on the wire it measured a hard 8.000 ms, and the
+cause was upstream of everything above: Pico-PIO-USB copies the controller's
+declared `bInterval` straight into its per-endpoint frame counter
+(`pio_usb_ll_configure_endpoint`), so a pad asking for 8 ms is polled at
+125 Hz — and nothing downstream can be faster than its own input. Neither the
+app transport nor the XInput output can invent samples that were never read.
+
+`xinput_host.c` therefore overrides the IN endpoint's interval to
+`XINPUT_HOST_IN_POLL_INTERVAL_MS` (1 ms) when the pad asks for something
+slower. Controllers routinely declare a lazy interval while answering far
+faster; an interrupt IN endpoint simply NAKs when it has nothing new, so
+polling more often costs bus bandwidth and nothing else. It is the same
+override that host-side "polling rate" tools apply on Windows.
+
+Raise the constant in `xinput_host.h` if a particular controller misbehaves
+when polled faster than it asked for.
+
 ## Build note
 
 `lib/tusb_gamepad/.../uart_bridge_task.cpp` needed `hardware/clocks.h` for

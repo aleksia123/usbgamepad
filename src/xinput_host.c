@@ -311,7 +311,26 @@ bool xinputh_open(uint8_t rhport, uint8_t dev_addr, tusb_desc_interface_t const 
         }
         tusb_desc_endpoint_t const *desc_ep = (tusb_desc_endpoint_t const *)p_desc;
         TU_ASSERT(TUSB_DESC_ENDPOINT == desc_ep->bDescriptorType);
-        TU_ASSERT(tuh_edpt_open(dev_addr, desc_ep));
+
+        // Poll the IN endpoint every frame regardless of what the pad asks for.
+        //
+        // Pico-PIO-USB copies bInterval straight into its per-endpoint frame
+        // counter (pio_usb_ll_configure_endpoint), so a pad declaring 8 ms is
+        // polled at 125 Hz and NOTHING downstream can be faster - not the app
+        // transport, not the XInput output. Controllers routinely declare a
+        // lazy interval while being able to answer far faster; an interrupt IN
+        // endpoint simply NAKs when it has nothing new, so asking more often
+        // costs a little bus bandwidth and nothing else. This is the same
+        // "polling rate override" trick host-side tools use on Windows.
+        tusb_desc_endpoint_t ep_desc = *desc_ep;
+        if (tu_edpt_dir(ep_desc.bEndpointAddress) == TUSB_DIR_IN &&
+            ep_desc.bInterval > XINPUT_HOST_IN_POLL_INTERVAL_MS)
+        {
+            TU_LOG1("XInput host: pad asks for bInterval %u ms, polling at %u ms\r\n",
+                    ep_desc.bInterval, XINPUT_HOST_IN_POLL_INTERVAL_MS);
+            ep_desc.bInterval = XINPUT_HOST_IN_POLL_INTERVAL_MS;
+        }
+        TU_ASSERT(tuh_edpt_open(dev_addr, &ep_desc));
         if (tu_edpt_dir(desc_ep->bEndpointAddress) == TUSB_DIR_OUT)
         {
             xid_itf->ep_out = desc_ep->bEndpointAddress;
