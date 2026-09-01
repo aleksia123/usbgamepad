@@ -119,7 +119,13 @@
 #endif
 
 //------------- CLASS -------------//
-#define CFG_TUD_HID               (MAX_GAMEPADS + 1)
+// XInput bypasses TinyUSB's built-in HID class entirely (raw class driver in
+// lib/tusb_gamepad). The one real HID interface is the app-transport
+// interface (src/app_transport.h) - independent of MAX_GAMEPADS.
+// board_config.h (included above) already defines this to MAX_GAMEPADS + 1;
+// override it.
+#undef CFG_TUD_HID
+#define CFG_TUD_HID               1
 #define CFG_TUD_CDC               1
 #define CFG_TUD_MSC               0
 #define CFG_TUD_MIDI              0

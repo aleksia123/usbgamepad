@@ -11,6 +11,8 @@
 #include "pio_usb.h"
 #include "tusb_gamepad.h"
 #include "hardware/timer.h"
+#include "app_transport.h"
+#include "usb_serial.h"
 
 // ------------------------------------------------------------------ //
 //  Board selection
@@ -89,9 +91,15 @@ int main(void)
 
     board_init();
 
+    // Must happen before core1 starts: reading the flash unique ID needs
+    // exclusive flash access on both cores, and core1 runs usbh_task() out of
+    // flash continuously once launched below.
+    usb_serial_string();
+
     enum InputMode input_mode = INPUT_MODE_XINPUT; // choose an input mode
 
     init_tusb_gamepad(input_mode); // initialize usb device with chosen input mode
+    app_transport_init();          // physical_state/output_state (see src/app_transport.h)
 
     multicore_reset_core1();
     multicore_launch_core1(usbh_task); // usb host stack on core 1
@@ -99,7 +107,8 @@ int main(void)
     while (1)
     {
         tud_task();
-        tusb_gamepad_task();
+        app_transport_core0_task(); // apply output_state -> gamepad(0), watchdog, send physical_state
+        tusb_gamepad_task();        // build & send XInput report from gamepad(0)
     }
 
     return 0;

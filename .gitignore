@@ -1,6 +1,15 @@
 build
 .vscode
+.claude
 release
 generated
-tools
 .ignore
+.thisenv
+.other
+.exe
+bin/
+obj/
+*.dll
+*.pdb
+*.exe
+*.cache

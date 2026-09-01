@@ -36,7 +36,10 @@ target_compile_options(tusb_gamepad PRIVATE -w) # suppress warnings from third-p
 file(GLOB_RECURSE SOURCES
     "src/main.c"
     "src/hid_app.c"
-    "src/xinput_host.c")
+    "src/xinput_host.c"
+    "src/app_transport.c"
+    "src/xinput_ms_os_desc.c"
+    "src/usb_serial.c")
 
 add_executable(${NAME} ${SOURCES})
 
@@ -47,11 +50,13 @@ target_include_directories(${NAME} PUBLIC
 target_link_libraries(${NAME}
     pico_stdlib
     pico_multicore
+    pico_sync
     hardware_pio
     hardware_clocks
     tinyusb_board
     tinyusb_host
     pico_pio_usb
+    pico_unique_id
     tusb_gamepad)
 
 pico_add_extra_outputs(${NAME})

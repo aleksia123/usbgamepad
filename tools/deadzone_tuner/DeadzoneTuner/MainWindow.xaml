@@ -1,0 +1,79 @@
+<Window x:Class="DeadzoneTuner.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Deadzone Tuner" Height="760" Width="1100"
+        Background="#1e1e1e">
+    <Grid Margin="12">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="300"/>
+            <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+
+        <StackPanel Grid.Column="0" Margin="0,0,12,0">
+            <TextBlock Text="Shape" FontWeight="Bold" Foreground="White" Margin="0,0,0,4"/>
+            <StackPanel Orientation="Horizontal" Margin="0,0,0,12">
+                <RadioButton x:Name="RadialRadio" Content="Radial" GroupName="Shape" Foreground="White"
+                             IsChecked="True" Checked="Shape_Changed" Margin="0,0,16,0"/>
+                <RadioButton x:Name="AxialRadio" Content="Axial" GroupName="Shape" Foreground="White"
+                             Checked="Shape_Changed"/>
+            </StackPanel>
+
+            <GroupBox x:Name="RadialGroup" Header="Radial" Foreground="White" BorderBrush="Gray" Margin="0,0,0,12">
+                <StackPanel Margin="6">
+                    <TextBlock x:Name="RDeadLabel" Text="Deadzone: 2600" Foreground="White"/>
+                    <Slider x:Name="RDeadSlider" Minimum="0" Maximum="32767" Value="2600" ValueChanged="Param_Changed"/>
+                    <TextBlock x:Name="RAntiLabel" Text="Anti-deadzone: 0%" Foreground="White"/>
+                    <Slider x:Name="RAntiSlider" Minimum="0" Maximum="100" Value="0" ValueChanged="Param_Changed"/>
+                    <TextBlock x:Name="RMaxLabel" Text="Maxzone: 100%" Foreground="White"/>
+                    <Slider x:Name="RMaxSlider" Minimum="1" Maximum="100" Value="100" ValueChanged="Param_Changed"/>
+                </StackPanel>
+            </GroupBox>
+
+            <GroupBox x:Name="AxialGroupX" Header="Axial - X" Foreground="White" BorderBrush="Gray" Margin="0,0,0,12" IsEnabled="False">
+                <StackPanel Margin="6">
+                    <TextBlock x:Name="XDeadLabel" Text="Deadzone: 2600" Foreground="White"/>
+                    <Slider x:Name="XDeadSlider" Minimum="0" Maximum="32767" Value="2600" ValueChanged="Param_Changed"/>
+                    <TextBlock x:Name="XAntiLabel" Text="Anti-deadzone: 20%" Foreground="White"/>
+                    <Slider x:Name="XAntiSlider" Minimum="0" Maximum="100" Value="20" ValueChanged="Param_Changed"/>
+                    <TextBlock x:Name="XMaxLabel" Text="Maxzone: 100%" Foreground="White"/>
+                    <Slider x:Name="XMaxSlider" Minimum="1" Maximum="100" Value="100" ValueChanged="Param_Changed"/>
+                </StackPanel>
+            </GroupBox>
+
+            <GroupBox x:Name="AxialGroupY" Header="Axial - Y" Foreground="White" BorderBrush="Gray" Margin="0,0,0,12" IsEnabled="False">
+                <StackPanel Margin="6">
+                    <TextBlock x:Name="YDeadLabel" Text="Deadzone: 2600" Foreground="White"/>
+                    <Slider x:Name="YDeadSlider" Minimum="0" Maximum="32767" Value="2600" ValueChanged="Param_Changed"/>
+                    <TextBlock x:Name="YAntiLabel" Text="Anti-deadzone: 20%" Foreground="White"/>
+                    <Slider x:Name="YAntiSlider" Minimum="0" Maximum="100" Value="20" ValueChanged="Param_Changed"/>
+                    <TextBlock x:Name="YMaxLabel" Text="Maxzone: 100%" Foreground="White"/>
+                    <Slider x:Name="YMaxSlider" Minimum="1" Maximum="100" Value="100" ValueChanged="Param_Changed"/>
+                </StackPanel>
+            </GroupBox>
+
+            <TextBlock x:Name="RawValueText" Text="Raw:  (0, 0)" Foreground="White" FontFamily="Consolas" Margin="0,8,0,0"/>
+            <TextBlock x:Name="OutValueText" Text="Out:  (0, 0)" Foreground="#88ccff" FontFamily="Consolas" Margin="0,4,0,12"/>
+
+            <TextBlock Text="Drag inside the square to move the raw stick position." Foreground="Gray" TextWrapping="Wrap" Margin="0,0,0,12"/>
+
+            <Button x:Name="CopyButton" Content="Copy C snippet" Click="CopyButton_Click" Padding="8,4"/>
+        </StackPanel>
+
+        <Grid Grid.Column="1">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="180"/>
+            </Grid.RowDefinitions>
+
+            <Border Grid.Row="0" BorderBrush="Gray" BorderThickness="1" Background="#111">
+                <Canvas x:Name="StickCanvas" ClipToBounds="True" Background="Transparent"
+                        SizeChanged="StickCanvas_SizeChanged"
+                        MouseDown="StickCanvas_MouseDown" MouseMove="StickCanvas_MouseMove" MouseUp="StickCanvas_MouseUp"/>
+            </Border>
+
+            <Border Grid.Row="1" Margin="0,12,0,0" BorderBrush="Gray" BorderThickness="1" Background="#111">
+                <Canvas x:Name="CurveCanvas" SizeChanged="CurveCanvas_SizeChanged"/>
+            </Border>
+        </Grid>
+    </Grid>
+</Window>

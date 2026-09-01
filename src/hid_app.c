@@ -58,6 +58,7 @@
 #include "host/usbh.h"
 #include "xinput_host.h"
 #include "tusb_gamepad.h"
+#include "app_transport.h"
 
 //--------------------------------------------------------------------+
 // State
@@ -66,8 +67,6 @@
 static bool    xinput_mounted = false;
 static uint8_t xinput_dev_addr = 0;
 static uint8_t xinput_instance = 0;
-static uint8_t motor_left  = 0;
-static uint8_t motor_right = 0;
 
 //--------------------------------------------------------------------+
 // Register the XInput host class driver with TinyUSB.
@@ -95,8 +94,6 @@ void hid_app_task(void)
     if (now - start_ms >= interval_ms)
     {
         start_ms = now;
-        // Push the host's requested rumble to the controller (non-blocking).
-        tuh_xinput_set_rumble(xinput_dev_addr, xinput_instance, motor_left, motor_right, false);
         // Re-arm the IN endpoint in case a previous receive_report failed
         tuh_xinput_receive_report(xinput_dev_addr, xinput_instance);
     }
@@ -108,10 +105,11 @@ void hid_app_task(void)
 
 static void process_xinput(const xinput_gamepad_t* p)
 {
-    Gamepad* gp = gamepad(0);
-
-    // Build state in locals first, then write to the shared gamepad in one
-    // shot so core 0 never sees a half-zeroed struct.
+    // Build state in locals first, then publish it as one atomic snapshot
+    // (see app_transport_publish_physical) so core 0 never sees a
+    // half-updated read. This is physical_state - it is never written
+    // directly into gamepad(0); XInput output is driven from output_state
+    // by app_transport_core0_task() on core 0 instead (src/app_transport.c).
     GamepadButtons   btns = {0};
     GamepadTriggers  trig = {0};
     GamepadJoysticks joy  = {0};
@@ -150,16 +148,37 @@ static void process_xinput(const xinput_gamepad_t* p)
     joy.rx = p->sThumbRX;
     joy.ry = p->sThumbRY;
 
-    // Commit to shared gamepad — no zero window visible to core 0
-    gp->buttons   = btns;
-    gp->triggers  = trig;
-    gp->joysticks = joy;
+    // Pack into the wire payload and publish atomically for core 0 / the
+    // custom HID interface (report 0x11).
+    app_controller_payload_t payload;
+    uint16_t wbtns = 0
+        | (btns.up    ? XINPUT_GAMEPAD_DPAD_UP        : 0)
+        | (btns.down  ? XINPUT_GAMEPAD_DPAD_DOWN      : 0)
+        | (btns.left  ? XINPUT_GAMEPAD_DPAD_LEFT       : 0)
+        | (btns.right ? XINPUT_GAMEPAD_DPAD_RIGHT      : 0)
+        | (btns.a     ? XINPUT_GAMEPAD_A               : 0)
+        | (btns.b     ? XINPUT_GAMEPAD_B               : 0)
+        | (btns.x     ? XINPUT_GAMEPAD_X               : 0)
+        | (btns.y     ? XINPUT_GAMEPAD_Y               : 0)
+        | (btns.lb    ? XINPUT_GAMEPAD_LEFT_SHOULDER   : 0)
+        | (btns.rb    ? XINPUT_GAMEPAD_RIGHT_SHOULDER  : 0)
+        | (btns.l3    ? XINPUT_GAMEPAD_LEFT_THUMB      : 0)
+        | (btns.r3    ? XINPUT_GAMEPAD_RIGHT_THUMB     : 0)
+        | (btns.back  ? XINPUT_GAMEPAD_BACK            : 0)
+        | (btns.start ? XINPUT_GAMEPAD_START           : 0)
+        | (btns.sys   ? XINPUT_GAMEPAD_GUIDE           : 0)
+        | (btns.misc  ? XINPUT_GAMEPAD_SHARE           : 0)
+    ;
 
-    __dmb();
+    payload.buttons       = wbtns;
+    payload.left_trigger  = trig.l;
+    payload.right_trigger = trig.r;
+    payload.thumb_lx      = joy.lx;
+    payload.thumb_ly      = joy.ly;
+    payload.thumb_rx      = joy.rx;
+    payload.thumb_ry      = joy.ry;
 
-    // Pass the host's requested rumble back out (sent in hid_app_task()).
-    motor_left  = gp->rumble.l;
-    motor_right = gp->rumble.r;
+    app_transport_publish_physical(&payload);
 }
 
 //--------------------------------------------------------------------+
@@ -183,15 +202,12 @@ void tuh_xinput_mount_cb(uint8_t dev_addr, uint8_t instance, const xinputh_inter
     {
         xinput_dev_addr = dev_addr;
         xinput_instance = instance;
-        motor_left  = 0;
-        motor_right = 0;
         xinput_mounted = true;
     }
 
     // Light player-1 LED, clear rumble, then start the input stream.
     tuh_xinput_set_led(dev_addr, instance, 0, true);
     tuh_xinput_set_led(dev_addr, instance, 1, true);
-    tuh_xinput_set_rumble(dev_addr, instance, 0, 0, true);
     tuh_xinput_receive_report(dev_addr, instance);
 }
 
@@ -202,6 +218,8 @@ void tuh_xinput_umount_cb(uint8_t dev_addr, uint8_t instance)
     if (xinput_mounted && xinput_dev_addr == dev_addr && xinput_instance == instance)
     {
         xinput_mounted = false;
+        app_transport_clear_physical();
+        app_transport_force_neutral();
     }
 }
 
@@ -237,4 +255,4 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
 void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* report, uint16_t len)
 {
     (void)dev_addr; (void)instance; (void)report; (void)len;
-}
+} 

@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>DeadzoneTuner</AssemblyName>
+    <RootNamespace>DeadzoneTuner</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Native deadzone DLL (built from ../native/deadzone_api.cpp) -->
+    <None Include="..\native\deadzone_native.dll" Link="deadzone_native.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>
