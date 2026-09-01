@@ -133,7 +133,40 @@ internal static class Program
 
         if (map) return MapReports(device);
         // --dump runs until Ctrl+C unless a window was requested explicitly.
+        WarnIfXInputSynthesizedCollection(device, candidates);
+
         return dump ? DumpReports(device, secondsSet ? seconds : 0) : ProbeRate(device, seconds);
+    }
+
+    /// <summary>
+    /// An "IG_00" path is NOT a collection the device declares - it is the HID
+    /// view xusb22.sys synthesizes for any XInput device (the classic way apps
+    /// detect an XInput pad). It is therefore served from the same ~125 Hz cache
+    /// XInputGetState uses, and timing it measures the cache, not the hardware.
+    /// Easy to hit by accident, since it is also the default filter.
+    /// </summary>
+    private static void WarnIfXInputSynthesizedCollection(HidDevice device, IReadOnlyList<HidDevice> allCandidates)
+    {
+        if (!device.DevicePath.Contains("ig_00", StringComparison.OrdinalIgnoreCase)) return;
+
+        Console.WriteLine();
+        Console.WriteLine("!! This is the XInput-synthesized collection (IG_00), not a real");
+        Console.WriteLine("!! device interface. Windows' xusb22.sys builds it for every XInput");
+        Console.WriteLine("!! device and serves it from the same ~125 Hz cache as");
+        Console.WriteLine("!! XInputGetState, so expect ~8 ms here no matter how fast the");
+        Console.WriteLine("!! hardware is. This measures the cache, not the endpoint.");
+
+        var others = allCandidates
+            .Where(d => !d.DevicePath.Contains("ig_00", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (others.Count > 0)
+        {
+            Console.WriteLine("!!");
+            Console.WriteLine("!! Other interfaces on this device, one of which is probably what");
+            Console.WriteLine("!! you meant to time (pick one with --filter <substring>):");
+            foreach (var d in others) Console.WriteLine($"!!   {d.DevicePath}");
+        }
+        Console.WriteLine();
     }
 
     private static void PrintUsage()
@@ -187,7 +220,10 @@ internal static class Program
             catch { usage = "maxInputReport=?"; }
 
             string tlc = DescribeTopLevelUsage(d);
-            Console.WriteLine($"  [{i}] {usage}{tlc}  product=\"{name}\"");
+            string synth = d.DevicePath.Contains("ig_00", StringComparison.OrdinalIgnoreCase)
+                ? "  [xusb22-synthesized XInput view - always ~125 Hz]"
+                : "";
+            Console.WriteLine($"  [{i}] {usage}{tlc}{synth}  product=\"{name}\"");
             Console.WriteLine($"      {d.DevicePath}");
         }
     }
