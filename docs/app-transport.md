@@ -84,15 +84,27 @@ Enumeration: Device Manager should show an *XInput-compatible* device plus a
 *HID-compliant vendor-defined device* under one parent at `VID_1209&PID_0001`.
 Interface 0 showing code 28 means the MS OS descriptor exchange did not happen.
 
-Rate, with `diagnostics/hid-rate-probe`:
+Rate, with `diagnostics/hid-rate-probe`. **List the nodes first** — a bound
+XInput device has more than one:
 
 ```powershell
-dotnet run -- --vid 1209 --pid 0001 --no-filter
+dotnet run -- --vid 1209 --pid 0001 --list
+dotnet run -- --vid 1209 --pid 0001 --filter mi_01
 ```
+
+Time the **`MI_01`** node — that is the app-transport interface (13-byte
+reports, first byte `0x11`).
+
+Do **not** time the `IG_00` node. That is not an interface the device declares:
+`xusb22.sys` synthesizes it for every XInput device (it is how apps detect an
+XInput pad) and serves it from the same ~125 Hz cache as `XInputGetState`, so
+it reads ~8 ms no matter how fast the hardware is. Its presence is still useful
+evidence — it means the MS OS descriptor handshake worked and `xusb22` bound
+interface 0. The probe prints a warning if you land on it.
 
 Move a stick continuously and read the **median** interval, not the average —
 HID only reports on change, so pauses inflate the mean without costing latency.
-Expect a median near 1.0 ms.
+Expect a median near 1.0 ms on `MI_01`.
 
 ## Build note
 
