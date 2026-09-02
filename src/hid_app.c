@@ -24,18 +24,9 @@
  */
 
 /* ===========================================================================
- *  hid_app.c  -  BIGBIG WON Rainbow 2 Pro support (XINPUT mode)
+ *  hid_app.c
  * ===========================================================================
- *
- *  PUT THE CONTROLLER IN XINPUT MODE FIRST (this is its DEFAULT):
- *
- *     Hold  B + HOME  for ~3 seconds until the HOME light turns GREEN.
- *
- *  In Xinput mode the Rainbow 2 Pro enumerates as a WIRED Xbox 360 controller.
- *  That is NOT a HID device - it uses a vendor-specific interface
- *  (class 0xFF, subclass 0x5D, protocol 0x01), so TinyUSB's HID host never
- *  sees it. We therefore register a small XInput HOST class driver
- *  (src/xinput_host.c) and consume its parsed reports here.
+ 
  *
  *  Plumbing:
  *    - usbh_app_driver_get_cb() below registers the XInput host class driver
